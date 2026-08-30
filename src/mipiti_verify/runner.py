@@ -14,9 +14,100 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .client import MipitiClient
+from .customer_dsse_signer import (
+    sign_verification_statement as sign_customer_dsse_statement,
+)
+from .sigstore_signer import sign_verification_statement
+from .tier2 import SUBJECT_FEATURE_DESCRIPTION, SUBJECT_REPOSITORY_FILE
 from .verifiers import get_verifier
+from .workspace_key_signer import WorkspaceKeySigner
 
 console = Console(stderr=True)
+
+
+# Tier-2 source-loading: types whose params carry ``pattern`` (a glob
+# expression resolved against ``project_root``) rather than ``file``.
+# Tier-1 globs the pattern; tier-2 mirrors the glob here so it sees
+# the same matched files. Keeping this list explicit (rather than
+# falling back to "if params has pattern, use it") preserves the
+# defense that types map to a single, expected source-resolution
+# strategy.
+_PATTERN_GLOB_TYPES: frozenset[str] = frozenset({"test_exists", "test_passes"})
+
+# Tier-2 source-loading: types whose tier-2 criterion may legitimately
+# be evaluated with empty SOURCE_CODE. The conservative default is the
+# empty set — every type requires source-code evidence and the pre-LLM
+# guard fails-closed otherwise. Add a type here only after confirming
+# its tier-2 template can produce a sound YES/NO verdict from params
+# alone.
+_EMPTY_SOURCE_OK_TYPES: frozenset[str] = frozenset()
+
+# Tier-2 subject resolution: which platform ``target`` values name a
+# subject the tier-2 templates can frame in their own terms. An
+# assertion whose content came from a target the runner has no framing
+# for keeps the repository-file framing it had before subjects were
+# modelled — the conservative default, not a silent re-interpretation.
+_TARGET_SUBJECT_KINDS: dict[str, str] = {
+    "feature_description": SUBJECT_FEATURE_DESCRIPTION,
+}
+
+
+def _load_pattern_source(project_root: Path, params: dict[str, Any]) -> str:
+    """Load source content for pattern-based tier-2 types.
+
+    Globs ``params["pattern"]`` against ``project_root`` (recursive,
+    same glob semantics as tier-1's pattern verifiers), reads each
+    matched file, concatenates with a ``# === <relative_path> ===``
+    separator so the LLM can distinguish files in multi-match results,
+    and truncates the combined content to 16K chars to match the
+    truncation budget the rest of the tier-2 source-loading path uses.
+
+    Returns ``""`` when no files match, the pattern is empty, or every
+    read fails — the caller's pre-LLM fail-closed guard catches that
+    case before invoking the LLM.
+    """
+    import glob
+
+    pattern = (params.get("pattern") or "").strip()
+    if not pattern:
+        return ""
+    try:
+        matches = glob.glob(str(project_root / pattern), recursive=True)
+    except Exception:
+        return ""
+    if not matches:
+        return ""
+    parts: list[str] = []
+    for match in sorted(matches):
+        try:
+            mpath = Path(match)
+            if not mpath.is_file():
+                continue
+            content = mpath.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        try:
+            rel = str(mpath.relative_to(project_root))
+        except ValueError:
+            rel = match
+        parts.append(f"# === {rel} ===\n{content}")
+    combined = "\n".join(parts)
+    if len(combined) > 16000:
+        combined = combined[:16000] + "\n... (truncated)"
+    return combined
+
+
+class AttestationRequiredError(RuntimeError):
+    """Raised when ``--require-attestation`` is set and no signer
+    produced a usable attestation for the run.
+
+    The runner's default behaviour on missing/failed signing is to
+    log a warning and submit unsigned; that's appropriate for
+    operator-friendly defaults but is not what a security-sensitive
+    CI gate wants. ``--require-attestation`` flips the failure mode
+    to fail-closed: the run exits non-zero rather than submitting
+    a result the audit-tool side cannot pin to a signing identity.
+    """
 
 
 def compute_content_hash(
@@ -46,6 +137,50 @@ def compute_content_hash(
     return f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
 
 
+# Fields of a pulled assertion record that describe the assertion itself:
+# the verified content (bound by ``compute_content_hash``) and its identity /
+# binding / provenance. Everything else on the record is the platform's
+# stored verdict state from earlier runs and is deliberately excluded.
+ATTESTED_ASSERTION_FIELDS: tuple[str, ...] = (
+    # content bound by the content hash
+    "id",
+    "type",
+    "params",
+    "description",
+    # binding: what the assertion evidences, and where
+    "control_id",
+    "assumption_id",
+    "functional_test_id",
+    "node_id",
+    "repo",
+    # provenance
+    "origin",
+    "inherited_from_model_id",
+    "created_by",
+    "created_at",
+)
+
+
+def attestation_assertion_records(
+    all_assertions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reduce pulled assertion records to what the attestation should carry.
+
+    A pulled record also holds the platform's stored verdict state from
+    earlier runs (tier statuses, reviewer prose, verification timestamps,
+    coherence results, supersession / deletion flags). CI did not verify
+    any of that, and this run's own verdicts travel in ``results``, so it
+    is left out. The signed payload is then a function of the assertion
+    specs, their bindings, and this run's verdicts — not of how much
+    history the platform holds on them. The content hash is unaffected:
+    every field it binds is kept.
+    """
+    return [
+        {k: a[k] for k in ATTESTED_ASSERTION_FIELDS if k in a}
+        for a in all_assertions
+    ]
+
+
 class Runner:
     """Orchestrates the pull → verify → submit flow."""
 
@@ -58,28 +193,91 @@ class Runner:
         tier2_api_key: str | None = None,
         ollama_url: str = "http://localhost:11434",
         oidc_token: str | None = None,
+        sigstore_tuf_url: str | None = None,
+        sigstore_trust_config_path: str | None = None,
+        workspace_signing_key_path: str | None = None,
+        customer_key_path: str | None = None,
+        customer_key_passphrase: str | None = None,
+        signing_prefer: str = "sigstore",
+        require_attestation: bool = False,
         dry_run: bool = False,
         reverify: bool = True,
         verbose: bool = False,
         repo: str = "",
         changed_files: set[str] | None = None,
         concurrency: int = 1,
+        component_id: str | None = None,
+        auto_component_path: bool = True,
     ) -> None:
         self.client = client
         self.project_root = Path(project_root).resolve()
         self.repo = repo or _auto_detect_repo(self.project_root)
+        self.component_id = component_id
+        self.auto_component_path = auto_component_path
+        self._component_path_resolved = False
         self.tier2_provider_name = tier2_provider
         self.tier2_model = tier2_model
         self.tier2_api_key = tier2_api_key
         self.ollama_url = ollama_url
-        # Fetch attestation audience from backend
-        _aud = ""
-        try:
-            _config = client.get_verification_config()
-            _aud = _config.get("attestation_audience", "")
-        except Exception:
-            pass  # backend may not support this endpoint yet
-        self.oidc_token = oidc_token or _auto_detect_oidc(_aud)
+        # The raw OIDC token is used only locally to mint a Sigstore bundle
+        # (see _sign_with_sigstore); it is never transmitted to Mipiti. For
+        # Sigstore signing, the token MUST have `aud=sigstore` — Fulcio
+        # and sigstore-python's IdentityToken validator both require it.
+        self.oidc_token = oidc_token or _auto_detect_oidc("sigstore")
+        self.sigstore_tuf_url = sigstore_tuf_url or os.environ.get(
+            "MIPITI_SIGSTORE_TUF_URL", ""
+        ) or None
+        self.sigstore_trust_config_path = sigstore_trust_config_path or os.environ.get(
+            "MIPITI_SIGSTORE_TRUST_CONFIG", ""
+        ) or None
+
+        # Workspace-ECDSA fallback signer. Used when:
+        #   (a) no OIDC token is available (Jenkins / Buildkite / self-managed
+        #       GitLab without ID tokens), OR
+        #   (b) the operator explicitly picks workspace-key over sigstore via
+        #       ``signing_prefer="workspace"`` (e.g. policy / testing).
+        # Auto-detected from MIPITI_WORKSPACE_SIGNING_KEY env var when the
+        # CLI flag is omitted, mirroring the `oidc_token` auto-detect pattern.
+        key_path = workspace_signing_key_path or os.environ.get(
+            "MIPITI_WORKSPACE_SIGNING_KEY", ""
+        ) or None
+        self.workspace_signer: WorkspaceKeySigner | None = None
+        if key_path:
+            try:
+                self.workspace_signer = WorkspaceKeySigner(key_path)
+            except ValueError as e:
+                # Bad key file is a hard error — surfacing it as silent fall-
+                # through to "submit unsigned" would defeat the operator's
+                # explicit signing intent.
+                raise ValueError(f"--workspace-signing-key load failed: {e}") from e
+
+        # Customer-keyed offline DSSE signer. Used for air-gapped and
+        # non-Sigstore CI (Jenkins, self-managed/older GitLab,
+        # Buildkite/CircleCI without OIDC, regulated networks) that cannot
+        # reach Sigstore at sign time. When a customer key is supplied it
+        # is the *preferred* path (before Sigstore) — the operator has
+        # explicitly opted into the customer-controlled, offline-verifiable
+        # attestation. Auto-detected from MIPITI_CUSTOMER_SIGNING_KEY /
+        # MIPITI_CUSTOMER_SIGNING_KEY_PASSPHRASE when the CLI flags are
+        # omitted, mirroring the other signer auto-detect patterns. The
+        # PEM is read lazily at sign time so a bad passphrase surfaces a
+        # clear error rather than silently submitting unsigned.
+        self.customer_key_path = customer_key_path or os.environ.get(
+            "MIPITI_CUSTOMER_SIGNING_KEY", ""
+        ) or None
+        self.customer_key_passphrase = customer_key_passphrase or os.environ.get(
+            "MIPITI_CUSTOMER_SIGNING_KEY_PASSPHRASE", ""
+        ) or None
+
+        prefer = (signing_prefer or "sigstore").lower()
+        if prefer not in ("sigstore", "workspace"):
+            raise ValueError(
+                f"--signing-prefer must be 'sigstore' or 'workspace' "
+                f"(got {signing_prefer!r})"
+            )
+        self.signing_prefer = prefer
+        self.require_attestation = bool(require_attestation)
+
         self.dry_run = dry_run
         self._developer_key = client.key_scope == "developer"
         self.reverify = reverify
@@ -87,23 +285,266 @@ class Runner:
         self.changed_files = changed_files
         self.concurrency = max(1, concurrency)
 
+    def _sign_with_workspace_key(self, content_hash: str) -> tuple[str, str]:
+        """Sign ``content_hash`` with the workspace ECDSA key.
+
+        Returns ``(signature_b64, signed_hex)`` accepted by the backend's
+        ``signature`` + ``signed_hash`` body fields, or ``("", "")`` if no
+        workspace key is configured. Failures are logged and also return
+        empty strings — the run still submits unsigned, mirroring the
+        Sigstore fallback path.
+        """
+        if self.workspace_signer is None:
+            return "", ""
+        try:
+            return self.workspace_signer.sign(content_hash)
+        except Exception as e:
+            console.print(
+                f"  [yellow]Workspace-key signing failed: {e} — submitting without attestation[/yellow]"
+            )
+            return "", ""
+
+    def _sign_with_customer_key(
+        self,
+        *,
+        model_id: str,
+        tier: int,
+        content_hash: str,
+        pipeline: dict[str, Any],
+        assertions: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+    ) -> str:
+        """Build a customer-keyed offline DSSE bundle for this tier's run.
+
+        Returns the bundle JSON, or ``""`` when no customer key is
+        configured. A bad key / passphrase is a hard error — surfacing it
+        as a silent fall-through to "submit unsigned" would defeat the
+        operator's explicit signing intent (same contract as the
+        workspace-key load error).
+        """
+        if not self.customer_key_path:
+            return ""
+        try:
+            return sign_customer_dsse_statement(
+                model_id=model_id,
+                tier=tier,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=assertions,
+                results=results,
+                key_path=self.customer_key_path,
+                passphrase=self.customer_key_passphrase,
+            )
+        except ValueError as e:
+            raise ValueError(f"--customer-key signing failed: {e}") from e
+
+    def _choose_attestation(
+        self,
+        *,
+        model_id: str,
+        tier: int,
+        content_hash: str,
+        pipeline: dict[str, Any],
+        assertions: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+    ) -> tuple[str, str, str, str]:
+        """Pick the attestation path per precedence.
+
+        Returns ``(bundle, signature, signed_hash, dsse_bundle)`` — exactly
+        one of ``dsse_bundle``, ``bundle``, or (``signature`` +
+        ``signed_hash``) is populated when signing succeeds; all empty when
+        no signer is available or every signer fails.
+
+        Precedence: when a customer key is supplied, the customer-keyed
+        offline DSSE path wins (the operator explicitly opted into the
+        customer-controlled, offline-verifiable attestation). Otherwise
+        Sigstore wins by default; ``signing_prefer="workspace"`` forces the
+        workspace-ECDSA path even when an OIDC token is present.
+        """
+        bundle, signature, signed_hash, dsse_bundle = "", "", "", ""
+
+        if self.customer_key_path:
+            dsse_bundle = self._sign_with_customer_key(
+                model_id=model_id,
+                tier=tier,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=assertions,
+                results=results,
+            )
+            if dsse_bundle:
+                if self.verbose:
+                    console.print(
+                        f"  [dim]Tier {tier} attestation: customer-dsse (offline)[/dim]"
+                    )
+                return "", "", "", dsse_bundle
+
+        if self.oidc_token and self.signing_prefer != "workspace":
+            bundle = self._sign_with_sigstore(
+                model_id=model_id,
+                tier=tier,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=assertions,
+                results=results,
+            )
+            if bundle:
+                if self.verbose:
+                    console.print(f"  [dim]Tier {tier} attestation: sigstore[/dim]")
+                return bundle, "", "", ""
+            # Sigstore failed — fall through to workspace key if available.
+
+        if self.workspace_signer is not None:
+            signature, signed_hash = self._sign_with_workspace_key(content_hash)
+            if signature:
+                if self.verbose:
+                    console.print(f"  [dim]Tier {tier} attestation: workspace-ecdsa[/dim]")
+                return "", signature, signed_hash, ""
+
+        if self.require_attestation:
+            raise AttestationRequiredError(
+                "No attestation available for this run "
+                f"(tier {tier}) and --require-attestation is set. "
+                "Configure one of: a customer-keyed offline DSSE key "
+                "(--customer-key, env: MIPITI_CUSTOMER_SIGNING_KEY) for "
+                "air-gapped / non-Sigstore CI; an OIDC token (CI "
+                "environment with id-token: write) for Sigstore signing; "
+                "or --workspace-signing-key (env: "
+                "MIPITI_WORKSPACE_SIGNING_KEY) for workspace-ECDSA "
+                "signing. All available signers attempted; none "
+                "produced an attestation."
+            )
+
+        if self.verbose:
+            console.print(f"  [dim]Tier {tier} attestation: none (submitting unsigned)[/dim]")
+        return "", "", "", ""
+
+    def _sign_with_sigstore(
+        self,
+        *,
+        model_id: str,
+        tier: int,
+        content_hash: str,
+        pipeline: dict[str, Any],
+        assertions: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+    ) -> str:
+        """Build a DSSE attestation for this tier's run and wrap it in a
+        Sigstore bundle.
+
+        Returns the bundle as a JSON string, or "" when no OIDC token is
+        available (self-hosted / non-OIDC CI). Failures are logged and also
+        return "" — the run still submits; it just lacks attestation. The
+        bundle's DSSE envelope carries the assertion + verdict payload
+        directly, making it self-contained for offline auditor verification.
+        """
+        if not self.oidc_token:
+            return ""
+        try:
+            return sign_verification_statement(
+                self.oidc_token,
+                model_id=model_id,
+                tier=tier,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=assertions,
+                results=results,
+                tuf_url=self.sigstore_tuf_url,
+                trust_config_path=self.sigstore_trust_config_path,
+            )
+        except Exception as e:
+            console.print(
+                f"  [yellow]Sigstore signing failed: {e} — submitting without attestation[/yellow]"
+            )
+            return ""
+
+    def _resolve_component_path(self, model_id: str) -> None:
+        """When ``--component CMP`` is set and the component declares a
+        ``path`` (e.g., ``services/auth`` for a monorepo sub-component),
+        join that path onto ``project_root`` so assertion paths resolve
+        relative to the component's directory.
+
+        Idempotent — safe to call multiple times. No-ops when:
+          - ``--component`` is not set (CLI verifies the whole repo).
+          - ``--no-component-path`` was passed (operator opted out, e.g.
+            because they're already invoking the CLI from the component
+            sub-directory).
+          - the component has no declared ``path`` (component lives at
+            repo root).
+          - the model fetch fails (network error, auth error, etc.) —
+            we log a warning and fall back to the unmodified
+            ``project_root`` rather than abort.
+        """
+        if self._component_path_resolved:
+            return
+        self._component_path_resolved = True
+        if not self.component_id or not self.auto_component_path:
+            return
+        try:
+            model = self.client.get_model(model_id)
+        except Exception as e:
+            if self.verbose:
+                console.print(
+                    f"  [yellow]Could not fetch model to resolve component path: {e}[/yellow]"
+                )
+            return
+        components = model.get("components") or []
+        target = next(
+            (c for c in components if c.get("id") == self.component_id),
+            None,
+        )
+        if target is None:
+            if self.verbose:
+                console.print(
+                    f"  [yellow]Component {self.component_id!r} not found on model;"
+                    " using --project-root as-is[/yellow]"
+                )
+            return
+        comp_path = (target.get("path") or "").strip().strip("/")
+        if not comp_path:
+            return
+        new_root = (self.project_root / comp_path).resolve()
+        if self.verbose:
+            console.print(
+                f"  [dim]Component {self.component_id!r} declares path "
+                f"{comp_path!r} → resolving assertion paths under {new_root}[/dim]"
+            )
+        self.project_root = new_root
+
     def run(self, model_id: str) -> dict[str, Any]:
         """Execute full verification pipeline. Returns summary report."""
+        self._resolve_component_path(model_id)
         details: list[dict[str, Any]] = []
 
         # --- Tier 1 ---
         t1_results, t1_details, t1_assertions = self._run_tier(model_id, tier=1)
         details.extend(t1_details)
 
+        pipeline = _pipeline_metadata()
+        # VCS-neutral "same code" identity — a content digest of the verified
+        # files. Shared by both tier submissions below. Independent of git/SVN/P4.
+        pipeline["source_digest"] = _source_digest(self.project_root, t1_assertions)
+
         t1_run_id = ""
         if t1_results and not self.dry_run and not self._developer_key:
             content_hash = compute_content_hash(t1_assertions, t1_results)
+            bundle, signature, signed_hash, dsse_bundle = self._choose_attestation(
+                model_id=model_id,
+                tier=1,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=attestation_assertion_records(t1_assertions),
+                results=t1_results,
+            )
             resp = self.client.submit_results(
                 model_id,
-                pipeline=_pipeline_metadata(),
+                pipeline=pipeline,
                 results=t1_results,
-                oidc_token=self.oidc_token,
+                bundle=bundle,
+                signature=signature,
+                signed_hash=signed_hash,
                 content_hash=content_hash,
+                dsse_bundle=dsse_bundle,
             )
             t1_run_id = resp.get("run_id", "")
 
@@ -114,12 +555,23 @@ class Runner:
         t2_run_id = ""
         if t2_results and not self.dry_run and not self._developer_key:
             content_hash = compute_content_hash(t2_assertions, t2_results)
+            bundle, signature, signed_hash, dsse_bundle = self._choose_attestation(
+                model_id=model_id,
+                tier=2,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=attestation_assertion_records(t2_assertions),
+                results=t2_results,
+            )
             resp = self.client.submit_results(
                 model_id,
-                pipeline=_pipeline_metadata(),
+                pipeline=pipeline,
                 results=t2_results,
-                oidc_token=self.oidc_token,
+                bundle=bundle,
+                signature=signature,
+                signed_hash=signed_hash,
                 content_hash=content_hash,
+                dsse_bundle=dsse_bundle,
             )
             t2_run_id = resp.get("run_id", "")
 
@@ -167,6 +619,12 @@ class Runner:
         self, model_id: str, tier: int
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         """Run verification for a single tier. Returns (api_results, detail_records, all_assertions)."""
+        if not self.repo:
+            raise RuntimeError(
+                "Repository scope is required but could not be auto-detected. "
+                "Pass --repo <owner/name> or run in an environment that exports "
+                "GITHUB_REPOSITORY (GitHub Actions) or CI_PROJECT_PATH (GitLab CI)."
+            )
         if self.reverify:
             pending = self.client.get_all_assertions(model_id, repo=self.repo)
         else:
@@ -179,6 +637,59 @@ class Runner:
             if self.verbose:
                 console.print(f"  No tier {tier} assertions pending")
             return [], [], []
+
+        # Strict per-repo scope filter. The server already scopes by
+        # ``repo`` at fetch time, but a misconfigured or impersonated
+        # response could include cross-repo assertions; the runner must
+        # never evaluate (and submit verdicts for) an assertion bound to
+        # a different repository. Sentinel ``no_repo`` is the contract
+        # for assertions that have no file-system scope (e.g.,
+        # feature_description targets) and passes through unconditionally.
+        # Assertions with no ``repo`` field at all are treated as
+        # ``no_repo`` — they predate per-repo scoping and have no
+        # filesystem boundary to enforce.
+        for ctrl_id, assertions in list(controls.items()):
+            kept_scope: list[dict[str, Any]] = []
+            for a in assertions:
+                a_repo = (a.get("repo") or "").strip()
+                if not a_repo or a_repo == "no_repo" or a_repo == self.repo:
+                    kept_scope.append(a)
+                    continue
+                console.print(
+                    f"[skip] {a.get('id', '<no-id>')}: "
+                    f"repo mismatch (assertion={a_repo}, "
+                    f"runner={self.repo})"
+                )
+            if kept_scope:
+                controls[ctrl_id] = kept_scope
+            else:
+                del controls[ctrl_id]
+        if not controls:
+            if self.verbose:
+                console.print(
+                    f"  No tier {tier} assertions remained after repo-scope filter"
+                )
+            return [], [], []
+
+        # Filter by component — only verify assertions for controls in this component
+        if self.component_id:
+            # Fetch controls to determine which belong to this component
+            try:
+                ctrl_data = self.client.get_controls(model_id, component_id=self.component_id)
+                component_ctrl_ids = {c["id"] for c in ctrl_data.get("controls", [])}
+                filtered_by_cmp: dict[str, list] = {}
+                for ctrl_id, assertions in controls.items():
+                    if ctrl_id in component_ctrl_ids:
+                        filtered_by_cmp[ctrl_id] = assertions
+                if self.verbose:
+                    skipped_cmp = len(controls) - len(filtered_by_cmp)
+                    if skipped_cmp:
+                        console.print(f"  Tier {tier}: skipped {skipped_cmp} control(s) (different component)")
+                controls = filtered_by_cmp
+                if not controls:
+                    return [], [], []
+            except Exception as e:
+                console.print(f"  [yellow]Warning: component filter failed ({e}), verifying all[/yellow]")
 
         # Filter to assertions referencing changed files when --changed-files is set.
         # Assertions without a file param are always included (can't be scoped).
@@ -296,17 +807,35 @@ class Runner:
             return {"status": "fail", "details": f"Verifier error: {e}"}
 
     def _verify_tier2(self, assertion: dict) -> dict[str, Any]:
-        """Run Tier 2 semantic verification using AI provider."""
-        tier2_prompt = assertion.get("tier2_prompt", "")
-        if not tier2_prompt:
-            return {"status": "skipped", "details": "No tier2_prompt provided"}
+        """Run Tier 2 semantic verification using AI provider.
 
+        The backend payload MUST carry the structured ``type`` +
+        ``params`` fields. The runner renders its own per-type
+        template locally with a fresh per-call boundary token —
+        there is no legacy path that consumes a backend-rendered
+        prompt. A payload missing these fields surfaces a clear
+        version-mismatch error so operators running mismatched
+        CLI/backend versions can upgrade.
+        """
         if self.tier2_provider_name is None:
             return {"status": "skipped", "details": "No --tier2-provider specified"}
 
+        a_type = assertion.get("type", "") or ""
+        a_params = assertion.get("params", {})
+        if not a_type or not isinstance(a_params, dict) or not a_params:
+            return {
+                "status": "fail",
+                "details": (
+                    "Backend payload missing required `type` / `params` "
+                    "fields. This mipiti-verify release requires a backend "
+                    "that ships the structured tier-2 payload. Upgrade the "
+                    "platform, or pin mipiti-verify to a release matching "
+                    "your backend."
+                ),
+            }
+
         # Read source content for context
-        params = assertion.get("params", {})
-        a_type = assertion.get("type", "")
+        params = a_params
         # For file_hash, tier 2 reviews the code that pins the hash (scope_file),
         # not the hashed file itself.
         if a_type == "file_hash":
@@ -314,13 +843,70 @@ class Runner:
         else:
             source_file = params.get("file", "")
         source_code = ""
+        # What the loaded content IS. The tier-2 template states its
+        # criterion in terms of the subject, so whichever branch below
+        # loads the content is also what settles the subject: a regex
+        # match in a repository file is code, the same match in the
+        # model's feature description is a design statement, and the
+        # two are not judged by the same rule. The runner is the only
+        # place that knows which one it loaded.
+        subject_kind = SUBJECT_REPOSITORY_FILE
         # For target-based assertions (e.g., feature_description), use
         # platform-injected content instead of reading from disk.
         # No truncation — content must match what Tier 1 verified via
         # resolve_content(). If it exceeds the provider's context window,
         # the provider will fail naturally with an informative error.
         if not source_file and params.get("target_content"):
-            source_code = params["target_content"]
+            # The mechanical tier evaluates its predicate over the
+            # SCOPED region of the target content — the same
+            # ``scope_start`` / ``scope_end`` slice it applies to a
+            # repository file — so that is the region its verdict
+            # speaks about. The tier-2 instruction text states, as
+            # trusted framing outside the boundary, that a mechanical
+            # step has already settled the regex over the payload
+            # below; handing over the whole target while the
+            # mechanical step read one section would make that framing
+            # false. Slice with the mechanical tier's own helper so
+            # both tiers read byte-identical text.
+            #
+            # Only the two pattern types may carry a target today, and
+            # they are exactly the types that scope through this
+            # helper. Applying it unconditionally keeps the invariant
+            # (tier 2 never reviews more than the mechanical tier
+            # judged) intact for any target-bearing type added later.
+            from .verifiers import RegexTimeoutError
+            from .verifiers.file_based import _extract_scope
+
+            try:
+                source_code = _extract_scope(params["target_content"], params)
+            except RegexTimeoutError as e:
+                # Fail closed, as the mechanical tier does on the same
+                # helper: a scope that cannot be evaluated leaves the
+                # reviewed region undetermined, and the unsliced
+                # content would ship that false framing. A scope that
+                # matches nothing yields empty content, which the
+                # pre-LLM guard below turns into its own refusal.
+                return {
+                    "status": "fail",
+                    "details": (
+                        f"Tier-2 could not resolve the assertion's scope over "
+                        f"the {params.get('target', 'target')!r} content: {e}. "
+                        f"Refusing to review a region wider than the one the "
+                        f"mechanical tier evaluated."
+                    ),
+                }
+            subject_kind = _TARGET_SUBJECT_KINDS.get(
+                params.get("target", ""), SUBJECT_REPOSITORY_FILE
+            )
+        elif not source_file and a_type in _PATTERN_GLOB_TYPES:
+            # Pattern-based types (test_exists, test_passes) use
+            # ``params["pattern"]`` and tier-1 globs it. Mirror that
+            # resolution here so tier-2 has the matched file contents as
+            # SOURCE_CODE — previously the runner looked up
+            # ``params["file"]`` and received empty source content while
+            # tier-1's glob succeeded, leaving tier-2 to evaluate an
+            # assertion with no evidence.
+            source_code = _load_pattern_source(self.project_root, params)
         elif source_file:
             from .verifiers import safe_resolve_path, PathTraversalError
             try:
@@ -354,8 +940,26 @@ class Runner:
                     # For pattern_matches/pattern_absent, center context around
                     # the match rather than taking the file head — ensures the
                     # reviewer sees the relevant code even in large files.
+                    # For function_exists/class_exists, hand the reviewer the
+                    # isolated definition block rather than the enclosing
+                    # file. Existence is settled by the structural tier; the
+                    # semantic tier judges only the body, so it must never be
+                    # asked to locate the symbol first. When the block can't
+                    # be isolated, fall through to the file-level handling.
+                    isolated = None
+                    if a_type in ("function_exists", "class_exists"):
+                        from .definition_extract import extract_definition
+                        isolated = extract_definition(
+                            content,
+                            "function" if a_type == "function_exists" else "class",
+                            params.get("name", ""),
+                        )
+                        if isolated is not None:
+                            content = isolated
                     pattern = params.get("pattern", "")
-                    if len(content) > 16000 and pattern and a_type in ("pattern_matches", "pattern_absent"):
+                    if isolated is not None:
+                        pass
+                    elif len(content) > 16000 and pattern and a_type in ("pattern_matches", "pattern_absent"):
                         import re
                         match = re.search(pattern, content)
                         if match:
@@ -392,11 +996,86 @@ class Runner:
                                 content = content[:16000] + "\n... (truncated)"
                         else:
                             content = content[:16000] + "\n... (truncated)"
+                    # For function_calls, center context on the caller's
+                    # definition so a large file doesn't hide the caller past
+                    # the 16K head window (leaving the reviewer with no way to
+                    # see the call).
+                    elif len(content) > 16000 and a_type == "function_calls":
+                        import re
+                        caller = params.get("caller", "")
+                        if caller:
+                            def_pat = rf'^[ \t]*(async\s+)?def\s+{re.escape(caller)}\s*\('
+                            match = re.search(def_pat, content, re.MULTILINE)
+                            if match:
+                                center = match.start()
+                                # Bias toward showing the body (4K before, 12K after)
+                                start = max(0, center - 4000)
+                                end = min(len(content), center + 12000)
+                                prefix = "... (truncated)\n" if start > 0 else ""
+                                suffix = "\n... (truncated)" if end < len(content) else ""
+                                content = prefix + content[start:end] + suffix
+                            else:
+                                content = content[:16000] + "\n... (truncated)"
+                        else:
+                            content = content[:16000] + "\n... (truncated)"
                     elif len(content) > 16000:
                         content = content[:16000] + "\n... (truncated)"
                     source_code = content
                 except Exception:
                     pass
+
+        # Pre-LLM fail-closed guard. If a type requires source-code
+        # evidence and loading produced nothing, refuse to call the LLM:
+        # an empty SOURCE_CODE block leaves nothing for the model to
+        # ground its verdict on, and an LLM that returns YES from the
+        # assertion's description alone is a false-pass — the assertion's
+        # ``description`` is a CLAIM, not evidence. Types listed in
+        # ``_EMPTY_SOURCE_OK_TYPES`` are exempted because their tier-2
+        # criterion can legitimately be evaluated on params alone.
+        if not source_code and a_type not in _EMPTY_SOURCE_OK_TYPES:
+            return {
+                "status": "fail",
+                "details": (
+                    f"Tier-2 has no source content to evaluate for "
+                    f"{a_type!r} assertion. Loading from params "
+                    f"(file / pattern / target_content) produced empty "
+                    f"content, and this type requires source-code "
+                    f"evidence — refusing to ask the LLM to evaluate "
+                    f"empty evidence."
+                ),
+            }
+
+        # Deterministic structural-presence precheck for existence types.
+        # Whether a symbol EXISTS is a structural fact; the deterministic
+        # structural verifier (the mechanical tier) is its sole authority. The
+        # semantic tier assesses the QUALITY of a symbol that exists — it is not
+        # a source of truth for existence itself. So for existence-type
+        # assertions, re-run the authoritative structural verifier on the FULL
+        # file (not the possibly-truncated SOURCE_CODE window built above),
+        # which applies the same check tier 1 uses, and skip the semantic pass
+        # when the symbol is absent. This keeps the semantic tier able only to
+        # downgrade a result, never to establish existence: a symbol that is
+        # genuinely present still proceeds to the quality check unchanged. Fail
+        # open on an unexpected verifier error (tier 1 remains the independent
+        # structural authority on its own pass).
+        if a_type in ("function_exists", "class_exists"):
+            structural = get_verifier(a_type)
+            if structural is not None:
+                try:
+                    present = structural.verify(params, self.project_root)
+                except Exception:
+                    present = None
+                if present is not None and not present.passed:
+                    return {
+                        "status": "fail",
+                        "details": (
+                            f"Tier-2 refused: the {a_type} target is not "
+                            f"present in the source ({present.details}). "
+                            f"Tier-2 is a semantic check and cannot affirm a "
+                            f"symbol's existence — the structural check is the "
+                            f"authority, and it did not find the symbol."
+                        ),
+                    }
 
         try:
             from .tier2 import get_provider
@@ -407,8 +1086,18 @@ class Runner:
                 api_key=self.tier2_api_key,
                 ollama_url=self.ollama_url,
             )
-            boundary_token = assertion.get("tier2_boundary_token", "")
-            passed, reasoning = provider.evaluate(tier2_prompt, source_code, boundary_token)
+            # Single-path runner-side rendering. The runner loads its
+            # own per-type Jinja template from ``templates/`` and
+            # renders it with a fresh per-call boundary token (see
+            # ``tier2._build_message`` and ``_prompt_renderer``).
+            # The token is minted at the call site, never crosses the
+            # network, and is never persisted.
+            passed, reasoning = provider.evaluate(
+                assertion_type=a_type,
+                assertion_params=a_params,
+                source_code=source_code,
+                subject_kind=subject_kind,
+            )
             return {
                 "status": "pass" if passed else "fail",
                 "details": reasoning,
@@ -458,12 +1147,13 @@ def _auto_detect_oidc(audience: str = "") -> str:
     if url and token:
         try:
             import httpx
+            from ._tls import tls_context
 
             if audience:
                 aud_url = f"{url}&audience={audience}" if "?" in url else f"{url}?audience={audience}"
             else:
                 aud_url = url
-            resp = httpx.get(aud_url, headers={"Authorization": f"Bearer {token}"})
+            resp = httpx.get(aud_url, headers={"Authorization": f"Bearer {token}"}, verify=tls_context())
             resp.raise_for_status()
             return resp.json().get("value", "")
         except Exception:
@@ -477,33 +1167,51 @@ def _auto_detect_oidc(audience: str = "") -> str:
     return ""
 
 
+def _source_digest(project_root: Path, assertions: list[dict[str, Any]]) -> str:
+    """A VCS-neutral content digest of the verified code.
+
+    Hashes the files the assertions reference (``params["file"]``), so it is the
+    precise "same code" identity independent of any source-control system — two
+    runs whose verified files are byte-identical produce the same digest even
+    under a rebase or on a different branch. Deterministic (files sorted; each
+    entry binds path + content); missing/out-of-root files are recorded as such
+    rather than skipped, so a deletion still changes the digest. Empty when no
+    assertion is file-scoped (e.g. pattern-only globs); the server then falls back
+    to the revision id."""
+    files = sorted(
+        {
+            f
+            for a in (assertions or [])
+            if (f := ((a.get("params") or {}).get("file", "")))
+        }
+    )
+    if not files:
+        return ""
+    root = project_root.resolve()
+    h = hashlib.sha256()
+    for rel in files:
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        try:
+            p = (root / rel).resolve()
+            if p.is_file() and p.is_relative_to(root):
+                h.update(hashlib.sha256(p.read_bytes()).hexdigest().encode("ascii"))
+            else:
+                h.update(b"<missing>")
+        except OSError:
+            h.update(b"<error>")
+        h.update(b"\n")
+    return "sha256:" + h.hexdigest()
+
+
 def _pipeline_metadata() -> dict[str, str]:
-    """Build pipeline metadata from environment."""
-    # GitHub Actions
-    if os.environ.get("GITHUB_ACTIONS"):
-        return {
-            "provider": "github_actions",
-            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
-            "run_url": f"{os.environ.get('GITHUB_SERVER_URL', '')}/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}",
-            "commit_sha": os.environ.get("GITHUB_SHA", ""),
-            "branch": os.environ.get("GITHUB_REF", ""),
-        }
+    """Build pipeline metadata via the VCS-neutral source-provenance resolver.
 
-    # GitLab CI
-    if os.environ.get("GITLAB_CI"):
-        return {
-            "provider": "gitlab_ci",
-            "run_id": os.environ.get("CI_PIPELINE_ID", ""),
-            "run_url": os.environ.get("CI_PIPELINE_URL", ""),
-            "commit_sha": os.environ.get("CI_COMMIT_SHA", ""),
-            "branch": os.environ.get("CI_COMMIT_REF_NAME", ""),
-        }
+    Delegates provider selection (GitHub / GitLab / generic-env / local) to
+    ``provenance.resolve_provenance``. The dict shape is unchanged — ``commit_sha``
+    carries the opaque revision id from whatever source-control the provider uses
+    — so the signed predicate stays byte-compatible while a non-git runner can now
+    supply provenance via SOURCE_REVISION / SOURCE_REPO / SOURCE_BRANCH."""
+    from .provenance import resolve_provenance
 
-    # Local / unknown
-    return {
-        "provider": "local",
-        "run_id": "",
-        "run_url": "",
-        "commit_sha": "",
-        "branch": "",
-    }
+    return resolve_provenance().to_pipeline_dict()

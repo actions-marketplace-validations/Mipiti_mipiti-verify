@@ -9,6 +9,40 @@ import httpx
 
 DEFAULT_BASE_URL = "https://api.mipiti.io"
 
+# How much of the response body to surface in the diagnostic message on
+# HTTP errors. Trimmed because some endpoints return verbose validation
+# detail (e.g. FastAPI's 422 with per-field errors) and we don't want to
+# spam CI logs, but enough to identify the root cause.
+_ERROR_BODY_PREVIEW_CHARS = 2000
+
+
+def _raise_for_status_with_body(resp: httpx.Response) -> None:
+    """Drop-in replacement for ``resp.raise_for_status()`` that surfaces
+    the response body in the raised exception.
+
+    Stock httpx prints only the status line + URL on error, which makes
+    diagnosing 4xx/5xx from the API painful — a 422 from FastAPI carries
+    the failing field path and message in the body, but the default error
+    swallows it. This helper preserves the same exception type
+    (``httpx.HTTPStatusError``) so callers that catch it still work, but
+    enriches the message with up to ``_ERROR_BODY_PREVIEW_CHARS`` of
+    response content.
+    """
+    if not resp.is_error:
+        return
+    try:
+        body = resp.text or "(empty body)"
+    except Exception as e:
+        body = f"(could not read body: {e})"
+    if len(body) > _ERROR_BODY_PREVIEW_CHARS:
+        body = body[:_ERROR_BODY_PREVIEW_CHARS] + " …(truncated)"
+    raise httpx.HTTPStatusError(
+        f"HTTP {resp.status_code} {resp.reason_phrase} for {resp.request.url}\n"
+        f"Response body: {body}",
+        request=resp.request,
+        response=resp,
+    )
+
 
 class MipitiClient:
     """Sync httpx client for pulling pending assertions and submitting results."""
@@ -28,10 +62,12 @@ class MipitiClient:
                 "or pass api_key= to MipitiClient."
             )
         self.key_scope = "verifier" if self.api_key.startswith("mv_") else "developer"
+        from ._tls import tls_context
         self._client = httpx.Client(
             base_url=self.base_url,
             headers={"X-API-Key": self.api_key},
             timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0),
+            verify=tls_context(),
         )
 
     def close(self) -> None:
@@ -61,7 +97,7 @@ class MipitiClient:
             f"/api/models/{model_id}/verification/pending",
             params=params,
         )
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
     # ------------------------------------------------------------------
@@ -80,7 +116,7 @@ class MipitiClient:
             f"/api/models/{model_id}/verification/assertions",
             params=params,
         )
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
     # ------------------------------------------------------------------
@@ -92,32 +128,47 @@ class MipitiClient:
         model_id: str,
         pipeline: dict[str, Any],
         results: list[dict[str, Any]],
-        oidc_token: str = "",
+        bundle: str = "",
         signature: str = "",
         signed_hash: str = "",
         content_hash: str = "",
+        dsse_bundle: str = "",
     ) -> dict[str, Any]:
-        """POST /api/models/{id}/verification/results"""
+        """POST /api/models/{id}/verification/results
+
+        CI-side attestation is carried by `bundle` — a Sigstore bundle (JSON-
+        serialised, bundle_v0.3) minted locally from the runner's OIDC token.
+        The raw token never leaves the runner; the backend verifies the bundle
+        against the Sigstore transparency log.
+
+        Self-hosted deployments without OIDC supply `signature` + `signed_hash`
+        produced with a workspace ECDSA key instead.
+
+        Air-gapped / non-Sigstore CI supplies `dsse_bundle` — a self-contained
+        customer-keyed DSSE attestation (standard DSSE / in-toto, signed
+        offline with the customer's ECDSA P-256 key). The backend verifies it
+        against the customer's registered workspace public key and stores it
+        opaquely in the audit envelope; no network at sign or verify time.
+        """
         body: dict[str, Any] = {
             "pipeline": pipeline,
             "results": results,
             "content_hash": content_hash,
         }
+        if bundle:
+            body["bundle"] = bundle
         if signature:
             body["signature"] = signature
         if signed_hash:
             body["signed_hash"] = signed_hash
-
-        headers: dict[str, str] = {}
-        if oidc_token:
-            headers["X-CI-Attestation"] = oidc_token
+        if dsse_bundle:
+            body["dsse_bundle"] = dsse_bundle
 
         resp = self._client.post(
             f"/api/models/{model_id}/verification/results",
             json=body,
-            headers=headers,
         )
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
     # ------------------------------------------------------------------
@@ -127,7 +178,7 @@ class MipitiClient:
     def list_models(self) -> list[dict[str, Any]]:
         """GET /api/models — list models accessible by this API key's workspace."""
         resp = self._client.get("/api/models")
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
     # ------------------------------------------------------------------
@@ -137,25 +188,22 @@ class MipitiClient:
     def get_model(self, model_id: str) -> dict[str, Any]:
         """GET /api/models/{id} — full model with controls."""
         resp = self._client.get(f"/api/models/{model_id}")
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
-    def get_controls(self, model_id: str) -> list[dict[str, Any]]:
-        """GET /api/models/{id}/controls — returns list of controls."""
-        resp = self._client.get(f"/api/models/{model_id}/controls")
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("controls", [])
+    def get_controls(self, model_id: str, component_id: str = "") -> dict[str, Any]:
+        """GET /api/models/{id}/controls — returns controls response dict."""
+        params: dict[str, str] = {}
+        if component_id:
+            params["component_id"] = component_id
+        resp = self._client.get(f"/api/models/{model_id}/controls", params=params)
+        _raise_for_status_with_body(resp)
+        return resp.json()
 
     def get_verification_report(self, model_id: str) -> dict[str, Any]:
         """GET /api/models/{id}/verification/report"""
         resp = self._client.get(f"/api/models/{model_id}/verification/report")
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
-    def get_verification_config(self) -> dict[str, Any]:
-        """GET /api/verification/config — fetch attestation audience etc."""
-        resp = self._client.get("/api/verification/config")
-        resp.raise_for_status()
-        return resp.json()
 

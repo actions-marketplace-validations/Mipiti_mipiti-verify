@@ -11,6 +11,7 @@ from mipiti_verify.verifiers.file_based import (
     NoPlaintextSecretVerifier,
     PatternAbsentVerifier,
     PatternMatchesVerifier,
+    _apply_inline_regex_flags,
 )
 
 
@@ -96,6 +97,110 @@ class TestPatternMatches:
         v = PatternMatchesVerifier()
         r = v.verify({"file": "missing.py", "pattern": r"def validate_\w+"}, project_root)
         assert r.passed is False
+
+    def test_lookahead_pattern_returns_clean_failure(self, project_root, capfd):
+        """Agent-submitted patterns using lookahead (unsupported by RE2) must
+        fail with a clean details string, and must not emit the google-re2
+        ABSL ``E0000 ... re2.cc:... Error parsing ... invalid perl operator``
+        noise to stderr. google-re2 1.1.x lets us silence that via
+        ``re2.Options(log_errors=False)``.
+        """
+        f = project_root / "code.py"
+        f.write_text("def verification(db = Depends(get_db)):\n    return True\n")
+
+        v = PatternMatchesVerifier()
+        # Pattern lifted from the CI incident: (?m)def.*verification.*(?!.*Depends).*:$
+        r = v.verify(
+            {"file": "code.py", "pattern": r"(?m)def.*verification.*(?!.*Depends).*:$"},
+            project_root,
+        )
+
+        # The assertion should fail gracefully, not raise.
+        assert r.passed is False
+        assert "Invalid regex pattern" in r.details
+
+        # And the C++ ABSL logger should have been silenced — no red E0000 lines
+        # leaking out to CI logs.
+        captured = capfd.readouterr()
+        assert "invalid perl operator" not in captured.err
+        assert "re2.cc" not in captured.err
+
+
+class TestApplyInlineRegexFlags:
+    """Unit tests for the helper that translates assertion flags → RE2 inline modifiers."""
+
+    def test_no_flags_returns_pattern_unchanged(self):
+        assert _apply_inline_regex_flags(r"^foo", {}) == r"^foo"
+
+    def test_multiline_true_string(self):
+        assert _apply_inline_regex_flags(r"^foo", {"multiline": "true"}) == r"(?m)^foo"
+
+    def test_multiline_one_string(self):
+        assert _apply_inline_regex_flags(r"^foo", {"multiline": "1"}) == r"(?m)^foo"
+
+    def test_multiline_false(self):
+        assert _apply_inline_regex_flags(r"^foo", {"multiline": "false"}) == r"^foo"
+
+    def test_dotall_true(self):
+        assert _apply_inline_regex_flags(r"foo.bar", {"dotall": "true"}) == r"(?s)foo.bar"
+
+    def test_both_flags_combined(self):
+        result = _apply_inline_regex_flags(r"^foo.*$", {"multiline": "true", "dotall": "true"})
+        assert result == r"(?ms)^foo.*$"
+
+    def test_case_insensitive_string_value(self):
+        assert _apply_inline_regex_flags(r"^x", {"multiline": "TRUE"}) == r"(?m)^x"
+
+    def test_unrelated_params_ignored(self):
+        assert _apply_inline_regex_flags(r"x", {"file": "foo.txt", "scope_start": "x"}) == r"x"
+
+
+class TestPatternMatchesWithFlags:
+    """Regression tests for the google-re2 flag bug.
+
+    google-re2 does not accept Python ``re`` flag integers — they must be
+    embedded as inline modifiers in the pattern. Before the fix, passing
+    ``multiline: true`` produced an AttributeError on the worker thread
+    and the verifier silently failed.
+    """
+
+    def test_multiline_anchor_matches_after_newline(self, project_root):
+        f = project_root / "multi.py"
+        f.write_text("first line\nsecond line\nthird line\n")
+        v = PatternMatchesVerifier()
+        # Without multiline, ^ matches only at the start of the whole string
+        r_default = v.verify({"file": "multi.py", "pattern": r"^second"}, project_root)
+        assert r_default.passed is False
+        # With multiline, ^ matches at the start of every line
+        r_multi = v.verify(
+            {"file": "multi.py", "pattern": r"^second", "multiline": "true"},
+            project_root,
+        )
+        assert r_multi.passed is True
+
+    def test_dotall_dot_matches_newline(self, project_root):
+        f = project_root / "spans.py"
+        f.write_text("start\n... middle ...\nend")
+        v = PatternMatchesVerifier()
+        # Without dotall, . does not match newline
+        r_default = v.verify({"file": "spans.py", "pattern": r"start.*end"}, project_root)
+        assert r_default.passed is False
+        # With dotall, . matches everything including newlines
+        r_dot = v.verify(
+            {"file": "spans.py", "pattern": r"start.*end", "dotall": "true"},
+            project_root,
+        )
+        assert r_dot.passed is True
+
+    def test_pattern_absent_with_multiline(self, project_root):
+        f = project_root / "noeval.py"
+        f.write_text("safe = 1\nalso_safe = 2\n")
+        v = PatternAbsentVerifier()
+        r = v.verify(
+            {"file": "noeval.py", "pattern": r"^eval", "multiline": "true"},
+            project_root,
+        )
+        assert r.passed is True
 
 
 class TestPatternAbsent:

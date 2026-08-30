@@ -22,7 +22,9 @@ AST structural proofs:
   S1: _verify_tier1 catches all exceptions → fail (never raises)
   S2: _verify_tier2 returns skipped when no provider
   S3: safe_resolve_path rejects path traversal
-  S4: safe_regex_search uses RE2 (import re2)
+  S4: pattern-matching safety — RE2-only, no Python `re` bypass, no
+      fallback that would disable linear-time guarantees (AST analysis
+      over every file in verifiers/)
 
 Usage:
     python formal/check_pipeline.py
@@ -389,19 +391,47 @@ def check_real_verifiers():
         result = runner._verify_tier2({
             "id": "test", "type": "function_exists",
             "params": {"file": "code.py", "name": "target_func"},
-            "tier2_prompt": "Does this function exist?",
         })
         if result["status"] != "skipped":
             violations.append(f"C6: tier2 without provider should skip, got {result['status']}")
         configs += 1
 
-        # C7: _verify_tier2 without prompt → skipped
+        # C7: _verify_tier2 with payload missing structured type/params →
+        # fail-fast with a clear version-mismatch error. The runner's
+        # single-path design refuses to evaluate a tier-2 assertion
+        # whose backend payload does not carry the structured shape.
+        runner.tier2_provider_name = "openai"
+        result = runner._verify_tier2({"id": "test", "params": {"file": "code.py"}})
+        if result["status"] != "fail":
+            violations.append(f"C7: tier2 with missing type should fail, got {result['status']}")
+        elif "Backend payload missing required" not in result.get("details", ""):
+            violations.append(
+                "C7: tier2 missing-type error must surface the version-mismatch message"
+            )
+        configs += 1
+
+        result = runner._verify_tier2({"id": "test", "type": "function_exists"})
+        if result["status"] != "fail":
+            violations.append(f"C7: tier2 with missing params should fail, got {result['status']}")
+        elif "Backend payload missing required" not in result.get("details", ""):
+            violations.append(
+                "C7: tier2 missing-params error must surface the version-mismatch message"
+            )
+        configs += 1
+
+        # C10: _verify_tier2 must not read `tier2_prompt` / `tier2_boundary_token`
+        # — no legacy field consumption. Verified structurally below in S7;
+        # functional check here pins that a payload carrying only legacy
+        # fields fails fast (no silent fallback to a less-defended path).
         result = runner._verify_tier2({
-            "id": "test", "type": "function_exists",
-            "params": {"file": "code.py", "name": "target_func"},
+            "id": "test",
+            "tier2_prompt": "Does this function exist?",
+            "tier2_boundary_token": "BOUNDARY_legacyguess123456789012",
         })
-        if result["status"] != "skipped":
-            violations.append(f"C7: tier2 without prompt should skip, got {result['status']}")
+        if result["status"] != "fail":
+            violations.append(
+                f"C10: tier2 with only legacy fields should fail, got {result['status']}"
+            )
         configs += 1
 
         # C8: I1 cross-check — Tier 1 failure can never become a pass
@@ -426,6 +456,35 @@ def check_real_verifiers():
             if t1["status"] not in ("fail", "skipped"):
                 violations.append(f"C8: tier1 unexpected status {t1['status']} for {case['type']}")
             configs += 1
+
+        # C11: function_calls positive cross-check — the real verifier must
+        # PASS when the caller genuinely calls the callee, including when the
+        # caller has a MULTI-LINE signature. The invariants I1/I3/C3/C8 all
+        # guard against false POSITIVES; without a positive function_calls
+        # case the formal layer is blind to a false NEGATIVE (correct code
+        # wrongly failing Tier 1), which is a real class of defect for a
+        # verification product.
+        v = get_verifier("function_calls")
+        (tmpdir / "calls.py").write_text(
+            "def wrapped(\n"
+            "    a: int,\n"
+            "    b: int,\n"
+            ") -> int:\n"
+            "    return helper(a, b)\n"
+            "\n"
+            "def single(x):\n"
+            "    return other(x)\n"
+        )
+        r = v.verify({"file": "calls.py", "caller": "wrapped", "callee": "helper"}, tmpdir)
+        if not r.passed:
+            violations.append("C11: function_calls should pass for multi-line-signature caller")
+        r = v.verify({"file": "calls.py", "caller": "single", "callee": "other"}, tmpdir)
+        if not r.passed:
+            violations.append("C11: function_calls should pass for single-line caller")
+        r = v.verify({"file": "calls.py", "caller": "wrapped", "callee": "absent"}, tmpdir)
+        if r.passed:
+            violations.append("C11: function_calls should fail when callee is absent")
+        configs += 3
 
         # C9: I6 cross-check — after tier1 fail, _run_tier for tier 2 would
         # not receive this assertion (server filters). But verify locally:
@@ -636,11 +695,120 @@ def check_ast_proofs():
         violations.append("S3: verifiers missing path confinement check")
     proofs += 1
 
-    # S4: safe_regex_search uses RE2
-    if "import re2" not in verifiers_src and "from re2" not in verifiers_src:
-        violations.append("S4: verifiers do not import re2")
-    if "re2.search" not in verifiers_src:
-        violations.append("S4: verifiers do not use re2.search")
+    # S4: pattern-matching safety (real AST analysis).
+    #
+    # Previously S4 was a substring grep for ``re2.search`` — a tripwire,
+    # not a structural proof (a comment mentioning the string would satisfy
+    # it). Upgraded here to real AST checks over every .py file in
+    # ``src/mipiti_verify/verifiers/``:
+    #
+    #   A. No ``import re`` / ``from re import …`` anywhere in verifiers/
+    #      (Python's ``re`` is ReDoS-unsafe — the whole point of routing
+    #      through RE2 is its linear-time guarantee. No bypass allowed.)
+    #
+    #   B. No attribute call ``re.{search|match|compile|fullmatch|finditer|
+    #      findall|sub}``. Belt-and-braces: even if A somehow permitted a
+    #      stray import, B catches the call.
+    #
+    #   C. ``safe_regex_search`` body contains ≥1 ``re2.{search|compile|
+    #      match|fullmatch}`` call. Guarantees the helper itself still
+    #      routes through RE2; prevents a future refactor from gutting
+    #      the helper while leaving the name in place.
+    #
+    #   D. No ``re2.set_fallback_notification(FALLBACK_ALLOW|FALLBACK_WARN)``.
+    #      google-re2's fallback mechanism can silently fall through to
+    #      Python ``re`` when RE2 rejects a pattern; only FALLBACK_EXCEPTION
+    #      preserves the safety invariant.
+    #
+    # This doesn't cover taint flow (proving that user-supplied patterns
+    # always reach safe_regex_search before being used). That would require
+    # data-flow analysis — out of scope here. A+B+C+D rules out the
+    # reasonable ways someone could reintroduce ReDoS exposure.
+
+    _PY_RE_CALLS = {"search", "match", "compile", "fullmatch", "finditer", "findall", "sub"}
+    _RE2_CALLS = {"search", "compile", "match", "fullmatch"}
+    _UNSAFE_FALLBACKS = {"FALLBACK_ALLOW", "FALLBACK_WARN"}
+
+    verifiers_dir = os.path.join(_VERIFY_SRC, "mipiti_verify", "verifiers")
+    s4_files = sorted(f for f in os.listdir(verifiers_dir) if f.endswith(".py"))
+
+    safe_search_fn_found = False
+    safe_search_re2_call_count = 0
+
+    for fname in s4_files:
+        fpath = os.path.join(verifiers_dir, fname)
+        with open(fpath) as f:
+            src = f.read()
+        tree = ast.parse(src)
+
+        for node in ast.walk(tree):
+            # A. Reject `import re` (any form) and `from re import ...`
+            # (unless the file is on the allowlist for hardcoded-only patterns)
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "re" or alias.name.startswith("re."):
+                        violations.append(
+                            f"S4.A: {fname} imports Python `re` — use re2 (linear-time)"
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                if node.module == "re":
+                    violations.append(
+                        f"S4.A: {fname} has `from re import …` — use re2 (linear-time)"
+                    )
+
+            # B. Reject `re.<call>(…)` for any regex method
+            elif isinstance(node, ast.Call):
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "re"
+                    and node.func.attr in _PY_RE_CALLS
+                ):
+                    violations.append(
+                        f"S4.B: {fname} calls re.{node.func.attr}() — use re2 (linear-time)"
+                    )
+
+                # D. Reject unsafe fallback notifications (detect via either
+                # `re2.set_fallback_notification(...)` or the call form after
+                # `from re2 import set_fallback_notification`).
+                fn = node.func
+                is_set_fallback = (
+                    isinstance(fn, ast.Attribute) and fn.attr == "set_fallback_notification"
+                ) or (isinstance(fn, ast.Name) and fn.id == "set_fallback_notification")
+                if is_set_fallback and node.args:
+                    arg = node.args[0]
+                    arg_id = (
+                        arg.attr if isinstance(arg, ast.Attribute)
+                        else arg.id if isinstance(arg, ast.Name)
+                        else None
+                    )
+                    if arg_id in _UNSAFE_FALLBACKS:
+                        violations.append(
+                            f"S4.D: {fname} set_fallback_notification({arg_id}) — "
+                            f"disables linear-time guarantee"
+                        )
+
+        # C. Inside safe_regex_search, count re2.{search|…} calls
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "safe_regex_search":
+                safe_search_fn_found = True
+                for child in ast.walk(node):
+                    if (
+                        isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Attribute)
+                        and isinstance(child.func.value, ast.Name)
+                        and child.func.value.id == "re2"
+                        and child.func.attr in _RE2_CALLS
+                    ):
+                        safe_search_re2_call_count += 1
+
+    if not safe_search_fn_found:
+        violations.append("S4.C: safe_regex_search function not found in verifiers/")
+    elif safe_search_re2_call_count == 0:
+        violations.append(
+            "S4.C: safe_regex_search body contains no "
+            "re2.{search,compile,match,fullmatch} call"
+        )
     proofs += 1
 
     # S5: Symlink rejection
@@ -705,7 +873,7 @@ def main():
         print(f"  I5: Tier 2 only runs after Tier 1 (both modes)")
         print(f"  I6a: Tier 1 failure skips Tier 2 (reverify=false)")
         print(f"  I6b: All assertions get Tier 2 evaluated (reverify=true)")
-        print(f"  C1-C9: Real code cross-check ({cross_configs} configs)")
+        print(f"  C1-C11: Real code cross-check ({cross_configs} configs)")
         print(f"  Model-based: invariants verified on real code (both modes)")
         print(f"  S1-S6: AST structural proofs ({ast_proofs} proofs)")
         print(f"{'=' * 70}")

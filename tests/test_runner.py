@@ -1,10 +1,106 @@
 """Tests for the verification runner."""
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from mipiti_verify.runner import Runner, _pipeline_metadata
+
+
+def _write_p256_pem(tmp_path: Path) -> Path:
+    key = ec.generate_private_key(ec.SECP256R1())
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    p = tmp_path / "ws.pem"
+    p.write_bytes(pem)
+    return p
+
+
+class TestSignWithSigstore:
+    """Runner's local OIDC-token → Sigstore-DSSE-bundle hook.
+
+    The raw OIDC token never leaves the runner; `_sign_with_sigstore`
+    converts it into a DSSE-based Sigstore bundle whose envelope carries
+    the full verification payload (assertions + verdicts + pipeline), so
+    the bundle is self-contained for offline auditor verification.
+    """
+
+    def _runner(self, oidc_token: str | None, **kwargs) -> Runner:
+        client = MagicMock()
+        client.key_scope = "verifier"
+        return Runner(client=client, oidc_token=oidc_token, **kwargs)
+
+    def _call_kwargs(self):
+        return dict(
+            model_id="m-abc",
+            tier=1,
+            content_hash="sha256:abc",
+            pipeline={"provider": "github_actions"},
+            assertions=[{"id": "asrt_001", "type": "function_exists"}],
+            results=[{"assertion_id": "asrt_001", "tier": 1, "result": "pass"}],
+        )
+
+    def test_no_token_returns_empty_bundle(self) -> None:
+        runner = self._runner(oidc_token=None)
+        assert runner._sign_with_sigstore(**self._call_kwargs()) == ""
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_success_returns_bundle_json(self, mock_sign: MagicMock) -> None:
+        mock_sign.return_value = '{"mediaType":"sigstore-bundle","dsseEnvelope":{}}'
+        runner = self._runner(oidc_token="eyJ.token")
+        got = runner._sign_with_sigstore(**self._call_kwargs())
+        assert got == '{"mediaType":"sigstore-bundle","dsseEnvelope":{}}'
+        mock_sign.assert_called_once_with(
+            "eyJ.token",
+            model_id="m-abc",
+            tier=1,
+            content_hash="sha256:abc",
+            pipeline={"provider": "github_actions"},
+            assertions=[{"id": "asrt_001", "type": "function_exists"}],
+            results=[{"assertion_id": "asrt_001", "tier": 1, "result": "pass"}],
+            tuf_url=None,
+            trust_config_path=None,
+        )
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_failure_is_swallowed_so_run_continues(self, mock_sign: MagicMock) -> None:
+        mock_sign.side_effect = RuntimeError("Fulcio unreachable")
+        runner = self._runner(oidc_token="eyJ.token")
+        # Must not raise — an attestation failure should not kill the run;
+        # the assertion verdicts themselves still submit (just unsigned).
+        assert runner._sign_with_sigstore(**self._call_kwargs()) == ""
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_private_tuf_url_forwarded(self, mock_sign: MagicMock) -> None:
+        mock_sign.return_value = "{}"
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            sigstore_tuf_url="https://sigstore.internal/tuf",
+        )
+        runner._sign_with_sigstore(**self._call_kwargs())
+        kwargs = mock_sign.call_args.kwargs
+        assert kwargs["tuf_url"] == "https://sigstore.internal/tuf"
+        assert kwargs["trust_config_path"] is None
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_trust_config_path_forwarded(self, mock_sign: MagicMock, tmp_path) -> None:
+        mock_sign.return_value = "{}"
+        cfg = tmp_path / "trust-config.json"
+        cfg.write_text("{}")
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            sigstore_trust_config_path=str(cfg),
+        )
+        runner._sign_with_sigstore(**self._call_kwargs())
+        kwargs = mock_sign.call_args.kwargs
+        assert kwargs["tuf_url"] is None
+        assert kwargs["trust_config_path"] == str(cfg)
 
 
 class TestRunner:
@@ -31,7 +127,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path))
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo")
         assert runner.reverify is True
         report = runner.run("m1")
 
@@ -67,7 +163,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 1
@@ -90,7 +186,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_fail"] == 1
@@ -118,7 +214,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), tier2_provider=None, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", tier2_provider=None, reverify=False)
         report = runner.run("m1")
 
         assert report["tier2_skip"] == 1
@@ -139,7 +235,7 @@ class TestRunner:
             {"model_id": "m1", "controls": {}},
         ]
 
-        runner = Runner(client=client, project_root=str(tmp_path), dry_run=True, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", dry_run=True, reverify=False)
         report = runner.run("m1")
 
         assert report["dry_run"] is True
@@ -182,7 +278,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), verbose=True, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", verbose=True, reverify=False)
         report = runner.run("m1")
 
         assert len(report["details"]) == 1
@@ -211,7 +307,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 2  # verify_token + config.json
@@ -238,7 +334,7 @@ class TestChangedFilesFilter:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), changed_files={"auth.py"}, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", changed_files={"auth.py"}, reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 1  # only auth.py verified
@@ -263,7 +359,7 @@ class TestChangedFilesFilter:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), changed_files=None, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", changed_files=None, reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 2  # both verified
@@ -284,7 +380,7 @@ class TestChangedFilesFilter:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), changed_files={"unrelated.py"}, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", changed_files={"unrelated.py"}, reverify=False)
         report = runner.run("m1")
 
         # asrt_001 filtered out (file=other.py not in changed), asrt_002 included (no file param)
@@ -311,7 +407,7 @@ class TestConcurrency:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), concurrency=4, tier2_provider=None, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", concurrency=4, tier2_provider=None, reverify=False)
         report = runner.run("m1")
 
         # Both skipped (no provider), but verifies concurrent path doesn't crash
@@ -335,7 +431,7 @@ class TestConcurrency:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", reverify=False)
         assert runner.concurrency == 1
         report = runner.run("m1")
         assert report["tier1_pass"] == 1
@@ -371,3 +467,347 @@ class TestPipelineMetadata:
         meta = _pipeline_metadata()
         assert meta["provider"] == "gitlab_ci"
         assert meta["run_id"] == "67890"
+
+
+class TestResolveComponentPath:
+    """`--component` triggers a model fetch to resolve the component's
+    declared `path` and prepend it to `--project-root`. The behavior
+    mirrors how monorepo CI workflows expect to invoke the CLI from
+    the repo root and have assertion paths resolve to the component
+    sub-directory.
+    """
+
+    def _runner(self, **overrides):
+        client = MagicMock()
+        client.key_scope = "verifier"
+        kwargs = dict(client=client, project_root=".", verbose=True)
+        kwargs.update(overrides)
+        return Runner(**kwargs)
+
+    def test_no_component_set_is_noop(self, tmp_path):
+        runner = self._runner(project_root=str(tmp_path))
+        runner.client.get_model = MagicMock()
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == tmp_path.resolve()
+        runner.client.get_model.assert_not_called()
+
+    def test_auto_component_path_disabled_is_noop(self, tmp_path):
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+            auto_component_path=False,
+        )
+        runner.client.get_model = MagicMock()
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == tmp_path.resolve()
+        runner.client.get_model.assert_not_called()
+
+    def test_component_path_joined_to_project_root(self, tmp_path):
+        sub = tmp_path / "services" / "auth"
+        sub.mkdir(parents=True)
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+        )
+        runner.client.get_model = MagicMock(return_value={
+            "components": [
+                {"id": "CMP0", "path": "ignore"},
+                {"id": "CMP1", "path": "services/auth"},
+            ],
+        })
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == sub.resolve()
+
+    def test_component_with_no_path_keeps_project_root(self, tmp_path):
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+        )
+        runner.client.get_model = MagicMock(return_value={
+            "components": [{"id": "CMP1", "path": ""}],
+        })
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == tmp_path.resolve()
+
+    def test_component_not_found_keeps_project_root(self, tmp_path):
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP-MISSING",
+        )
+        runner.client.get_model = MagicMock(return_value={
+            "components": [{"id": "CMP1", "path": "services/auth"}],
+        })
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == tmp_path.resolve()
+
+    def test_model_fetch_failure_keeps_project_root(self, tmp_path):
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+        )
+        runner.client.get_model = MagicMock(side_effect=RuntimeError("offline"))
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == tmp_path.resolve()
+
+    def test_resolve_is_idempotent(self, tmp_path):
+        sub = tmp_path / "services" / "auth"
+        sub.mkdir(parents=True)
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+        )
+        runner.client.get_model = MagicMock(return_value={
+            "components": [{"id": "CMP1", "path": "services/auth"}],
+        })
+        runner._resolve_component_path("m-1")
+        runner._resolve_component_path("m-1")
+        runner._resolve_component_path("m-1")
+        # Mock called once, not three times — idempotency guards against
+        # re-applying the path-prefix on every tier-N invocation.
+        assert runner.client.get_model.call_count == 1
+        assert runner.project_root == sub.resolve()
+
+    def test_path_with_leading_or_trailing_slash_is_normalized(self, tmp_path):
+        sub = tmp_path / "services" / "auth"
+        sub.mkdir(parents=True)
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+        )
+        runner.client.get_model = MagicMock(return_value={
+            "components": [{"id": "CMP1", "path": "/services/auth/"}],
+        })
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == sub.resolve()
+
+
+class TestChooseAttestation:
+    """Precedence dispatch: sigstore vs. workspace-key vs. unsigned.
+
+    Default: OIDC + Sigstore wins; workspace key is the fallback for
+    non-OIDC CIs (Jenkins, Buildkite, self-managed GitLab without ID
+    tokens). ``signing_prefer="workspace"`` forces the ECDSA path even
+    when an OIDC token is available.
+    """
+
+    def _runner(self, **kwargs) -> Runner:
+        client = MagicMock()
+        client.key_scope = "verifier"
+        return Runner(client=client, **kwargs)
+
+    def _call_kwargs(self):
+        return dict(
+            model_id="m-abc",
+            tier=1,
+            content_hash="sha256:" + "ab" * 32,
+            pipeline={"provider": "github_actions"},
+            assertions=[{"id": "asrt_001", "type": "function_exists"}],
+            results=[{"assertion_id": "asrt_001", "tier": 1, "result": "pass"}],
+        )
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_sigstore_wins_by_default(self, mock_sign: MagicMock, tmp_path: Path) -> None:
+        mock_sign.return_value = '{"mediaType":"sigstore-bundle"}'
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+        )
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(**self._call_kwargs())
+        assert bundle == '{"mediaType":"sigstore-bundle"}'
+        assert signature == ""
+        assert signed_hash == ""
+        assert dsse_bundle == ""
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_workspace_picked_when_no_oidc(
+        self, mock_sign: MagicMock, tmp_path: Path
+    ) -> None:
+        runner = self._runner(
+            oidc_token=None,
+            workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+        )
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(**self._call_kwargs())
+        mock_sign.assert_not_called()
+        assert bundle == ""
+        assert signature  # base64 DER
+        assert signed_hash == "ab" * 32
+        assert dsse_bundle == ""
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_signing_prefer_workspace_skips_sigstore(
+        self, mock_sign: MagicMock, tmp_path: Path
+    ) -> None:
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+            signing_prefer="workspace",
+        )
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(**self._call_kwargs())
+        mock_sign.assert_not_called()
+        assert bundle == ""
+        assert signature
+        assert signed_hash == "ab" * 32
+        assert dsse_bundle == ""
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_sigstore_failure_falls_through_to_workspace(
+        self, mock_sign: MagicMock, tmp_path: Path
+    ) -> None:
+        # Sigstore signing fails (Fulcio unreachable, etc.) — the workspace
+        # key fallback should still produce an attestation rather than
+        # silently submit unsigned, since the operator did configure a key.
+        mock_sign.side_effect = RuntimeError("Fulcio unreachable")
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+        )
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(**self._call_kwargs())
+        assert bundle == ""
+        assert signature
+        assert signed_hash == "ab" * 32
+        assert dsse_bundle == ""
+
+    def test_no_signer_returns_all_empty(self) -> None:
+        runner = self._runner(oidc_token=None)
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(**self._call_kwargs())
+        assert bundle == ""
+        assert signature == ""
+        assert signed_hash == ""
+        assert dsse_bundle == ""
+
+    def test_invalid_signing_prefer_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="signing-prefer must be"):
+            self._runner(
+                workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+                signing_prefer="bogus",
+            )
+
+    def test_require_attestation_raises_when_no_signer(self) -> None:
+        """No OIDC, no workspace key, --require-attestation set: raise
+        AttestationRequiredError so the run exits non-zero rather than
+        submitting unsigned."""
+        from mipiti_verify.runner import AttestationRequiredError
+
+        runner = self._runner(oidc_token=None, require_attestation=True)
+        with pytest.raises(AttestationRequiredError, match="No attestation available"):
+            runner._choose_attestation(**self._call_kwargs())
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_require_attestation_raises_when_both_signers_fail(
+        self, mock_sign: MagicMock, tmp_path: Path
+    ) -> None:
+        """OIDC + workspace key both configured, both fail at sign time,
+        --require-attestation set: raise rather than fall through to
+        unsigned."""
+        from mipiti_verify.runner import AttestationRequiredError
+
+        mock_sign.side_effect = RuntimeError("Fulcio unreachable")
+        # Construct a workspace signer whose sign() also fails.
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+            require_attestation=True,
+        )
+        runner.workspace_signer.sign = MagicMock(
+            side_effect=RuntimeError("workspace signing failed"),
+        )
+        with pytest.raises(AttestationRequiredError, match="No attestation available"):
+            runner._choose_attestation(**self._call_kwargs())
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_require_attestation_lets_successful_signing_pass(
+        self, mock_sign: MagicMock
+    ) -> None:
+        """--require-attestation must NOT change behaviour when signing
+        succeeds. Sigstore returns a bundle → run continues normally."""
+        mock_sign.return_value = '{"mediaType":"sigstore-bundle"}'
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            require_attestation=True,
+        )
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(
+            **self._call_kwargs()
+        )
+        assert bundle == '{"mediaType":"sigstore-bundle"}'
+        assert signature == ""
+        assert signed_hash == ""
+        assert dsse_bundle == ""
+
+    def test_require_attestation_default_off_preserves_unsigned_path(
+        self,
+    ) -> None:
+        """Default behaviour (require_attestation=False) is preserved:
+        no signer available → return all-empty (submit unsigned)
+        rather than raise."""
+        runner = self._runner(oidc_token=None)
+        # No exception raised; tuple of empties returned.
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(
+            **self._call_kwargs()
+        )
+        assert (bundle, signature, signed_hash, dsse_bundle) == ("", "", "", "")
+
+    def test_bad_workspace_key_path_raises(self, tmp_path: Path) -> None:
+        bad = tmp_path / "bad.pem"
+        bad.write_bytes(b"not a PEM")
+        with pytest.raises(ValueError, match="--workspace-signing-key load failed"):
+            self._runner(workspace_signing_key_path=str(bad))
+
+    def test_env_var_picks_up_workspace_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _write_p256_pem(tmp_path)
+        monkeypatch.setenv("MIPITI_WORKSPACE_SIGNING_KEY", str(path))
+        runner = self._runner(oidc_token=None)
+        assert runner.workspace_signer is not None
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_customer_key_preferred_over_sigstore(
+        self, mock_sign: MagicMock, tmp_path: Path
+    ) -> None:
+        """When a customer key is supplied it wins even over an available
+        OIDC token: the operator explicitly opted into the
+        customer-controlled, offline-verifiable attestation."""
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            customer_key_path=str(_write_p256_pem(tmp_path)),
+        )
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(
+            **self._call_kwargs()
+        )
+        mock_sign.assert_not_called()  # Sigstore path not taken
+        assert bundle == ""
+        assert signature == ""
+        assert signed_hash == ""
+        assert dsse_bundle  # JSON customer-dsse bundle
+        import json as _j
+
+        parsed = _j.loads(dsse_bundle)
+        assert parsed["kind"] == "customer-dsse"
+
+    def test_customer_key_env_var_autodetected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _write_p256_pem(tmp_path)
+        monkeypatch.setenv("MIPITI_CUSTOMER_SIGNING_KEY", str(path))
+        runner = self._runner(oidc_token=None)
+        assert runner.customer_key_path == str(path)
+
+    def test_bad_customer_key_passphrase_raises(self, tmp_path: Path) -> None:
+        """A wrong/missing passphrase is a hard error, not a silent
+        fall-through to unsigned — the operator's signing intent is
+        explicit."""
+        key = ec.generate_private_key(ec.SECP256R1())
+        enc = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.BestAvailableEncryption(b"correct"),
+        )
+        kp = tmp_path / "enc.pem"
+        kp.write_bytes(enc)
+        runner = self._runner(
+            oidc_token=None,
+            customer_key_path=str(kp),
+            customer_key_passphrase="wrong",
+        )
+        with pytest.raises(ValueError, match="--customer-key signing failed"):
+            runner._choose_attestation(**self._call_kwargs())

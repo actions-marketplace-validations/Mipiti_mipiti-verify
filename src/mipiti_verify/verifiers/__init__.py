@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import re2
 import sys
 from dataclasses import dataclass
@@ -24,6 +23,17 @@ class PathTraversalError(Exception):
 
 class RegexTimeoutError(Exception):
     """Raised when a regex operation exceeds the time limit."""
+
+
+# Shared RE2 compile options — silence google-re2's C++ ABSL logger so that
+# patterns containing RE2-rejected constructs (lookahead, lookbehind,
+# backreferences) do not emit a red ``E0000 ... re2.cc:... Error parsing ...
+# invalid perl operator: (?!`` line to stderr before our Python exception
+# handler sees the re2.error. The parse error still propagates normally and
+# is surfaced via RegexTimeoutError with a clean details string; log_errors
+# only controls the noisy ABSL pre-exception log.
+_RE2_OPTS = re2.Options()
+_RE2_OPTS.log_errors = False
 
 
 def safe_resolve_path(project_root: Path, file_param: str) -> Path:
@@ -94,7 +104,45 @@ def resolve_content(params: dict, project_root: Path) -> tuple[str | None, str]:
     return None, "<no source>"
 
 
-def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0, flags: int = 0) -> re.Match | None:
+def resolve_file_content(params: dict, project_root: Path) -> tuple[str | None, str]:
+    """Resolve assertion content from a repository file, refusing a target.
+
+    For verifiers whose subject is a repository artifact by definition
+    (RTL sources, for example): platform-held content is not a subject
+    they can be evaluated against, so a ``target`` param is refused
+    rather than honoured.
+
+    A type may accept a target only where both of these hold:
+
+    1. Its tier-1 predicate is a caller-supplied regex evaluated over
+       arbitrary text, drawing on no structure of a source language.
+    2. Its tier-2 criterion and its schema description are stated over
+       the matched text itself, not over the role the scanned artifact
+       plays in the running system.
+
+    ``pattern_matches`` and ``pattern_absent`` are the two types that
+    meet both, and they read through ``resolve_content``. A type that
+    fails either half means something different of a design
+    specification than it does of a file — a symbol found in prose
+    describes the prose, not anything the running system does — so it
+    resolves through here and its subject stays the file.
+
+    Returns (content, source_label). content is None if the file is not found.
+    Raises PathTraversalError for file path escapes.
+    Raises ValueError when a target is supplied.
+    """
+    if params.get("target"):
+        raise ValueError(
+            "This assertion type verifies a repository file and does not accept a 'target'"
+        )
+    file_param = params.get("file")
+    if file_param:
+        content = safe_read_file(project_root, file_param)
+        return content, file_param
+    return None, "<no source>"
+
+
+def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0) -> object | None:
     """Run regex search using RE2 with a cross-platform threading timeout.
 
     Two layers of protection:
@@ -104,9 +152,15 @@ def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0, 
     Patterns using backreferences, lookahead, or lookbehind are rejected
     at parse time (these are the constructs that enable ReDoS).
 
+    Returns the google-re2 match object on success (truthy), or None.
+    Callers may use truthiness or call ``.group(N)`` for capture groups.
+
+    To pass flags, embed them as inline modifiers in the pattern itself
+    using google-re2's ``(?ims)`` syntax (e.g. ``(?m)^foo`` for multiline).
+    google-re2 does not accept Python ``re`` flag integers.
+
     Args:
         timeout_seconds: Maximum wall-clock time for the search (default 2s).
-        flags: re.MULTILINE, re.DOTALL, etc.
     """
     import threading
 
@@ -115,7 +169,7 @@ def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0, 
 
     def _run():
         try:
-            result_box.append(re2.search(pattern, content, flags))
+            result_box.append(re2.search(pattern, content, options=_RE2_OPTS))
         except re2.error as e:
             error_box.append(e)
 
@@ -160,4 +214,4 @@ def get_verifier(assertion_type: str) -> Verifier | None:
 
 def _load_all() -> None:
     """Import all verifier modules to trigger registration."""
-    from . import file_based, code_structure, config, dependencies, tests, semantic  # noqa: F401
+    from . import file_based, code_structure, config, dependencies, tests, semantic, rtl  # noqa: F401

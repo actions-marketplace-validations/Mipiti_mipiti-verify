@@ -48,6 +48,26 @@ inputs:
     description: Max concurrent Tier 2 LLM calls
     required: false
     default: "1"
+  sigstore-tuf-url:
+    description: Custom Sigstore TUF root URL for private deployments (default public sigstore.dev)
+    required: false
+    default: ""
+  sigstore-trust-config:
+    description: Path to a pre-downloaded Sigstore ClientTrustConfig JSON (out-of-band snapshot, skips all TUF network fetches)
+    required: false
+    default: ""
+  workspace-signing-key:
+    description: "Path to a PEM ECDSA P-256 private key for workspace-attested submission. Used when no OIDC token is available (e.g. self-hosted runners without id-token: write), or when signing-prefer=workspace. The matching public key must be registered on the Mipiti workspace."
+    required: false
+    default: ""
+  signing-prefer:
+    description: "When both an OIDC token and a workspace key are available, prefer this signer ('sigstore' or 'workspace'). Default: sigstore."
+    required: false
+    default: "sigstore"
+  require-attestation:
+    description: "Fail the run when no attestation is produced (Sigstore or workspace-ECDSA). Default behaviour is to log a warning and submit unsigned when both signers are unavailable; with this flag, the runner exits non-zero. Set to 'true' for security-sensitive CI gates."
+    required: false
+    default: "false"
 
 outputs:
   content-hash:
@@ -55,7 +75,7 @@ outputs:
 
 runs:
   using: docker
-  image: Dockerfile
+  image: docker://ghcr.io/mipiti/mipiti-verify:v0.51.4@sha256:ecad8e9f890f025277cedd9b797111f8ec1bc2960cc47b89dd686183ed9d0e22
   env:
     MIPITI_API_KEY: ${{ inputs.api-key }}
     MIPITI_BASE_URL: ${{ inputs.base-url }}
@@ -69,3 +89,8 @@ runs:
     INPUT_REVERIFY: ${{ inputs.reverify }}
     INPUT_DRY_RUN: ${{ inputs.dry-run }}
     INPUT_CONCURRENCY: ${{ inputs.concurrency }}
+    INPUT_SIGSTORE_TUF_URL: ${{ inputs.sigstore-tuf-url }}
+    INPUT_SIGSTORE_TRUST_CONFIG: ${{ inputs.sigstore-trust-config }}
+    INPUT_WORKSPACE_SIGNING_KEY: ${{ inputs.workspace-signing-key }}
+    INPUT_SIGNING_PREFER: ${{ inputs.signing-prefer }}
+    INPUT_REQUIRE_ATTESTATION: ${{ inputs.require-attestation }}
