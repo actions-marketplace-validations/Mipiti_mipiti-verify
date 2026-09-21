@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # In a GitHub Actions container action, the runner overrides HOME to
 # /github/home, owned by the runner uid — which the non-root `verifier` user
@@ -8,10 +8,135 @@ set -e
 # writable home so the cache (and any HOME-based state) works.
 export HOME=/home/verifier
 
+# Attestations are written under the project root by default. The checkout
+# belongs to the runner's uid, which the `verifier` user often cannot write
+# to; when that directory cannot be created, write and read attestations
+# from the container's own home instead. Both the attest and the verify
+# step of one job read the same variable, so nothing else needs to change.
+if [ -z "${MIPITI_ATTESTATION_DIR:-}" ]; then
+  if ! mkdir -p "${INPUT_PROJECT_ROOT:-.}/.mipiti/attestations" 2>/dev/null; then
+    export MIPITI_ATTESTATION_DIR=/home/verifier/attestations
+    mkdir -p "$MIPITI_ATTESTATION_DIR"
+    echo "::notice::.mipiti/attestations is not writable in this checkout; attestations are kept in $MIPITI_ATTESTATION_DIR for this job"
+  fi
+fi
+
+# A test result becomes evidence by being recorded from the report your own
+# test step produced. Done here so using the action is a single step: the
+# alternative would be installing the CLI separately just to run one command.
+# This reads the report; it does not run tests.
+if [ -n "$INPUT_JUNIT_REPORT" ]; then
+  for report in $INPUT_JUNIT_REPORT; do
+    # Accept a path relative to project-root (the natural way to write it) or
+    # one that already resolves as given. A plain `[ -f x ] && y=z` would abort
+    # the script under `set -e` whenever the first location misses, so the
+    # branch is explicit.
+    if [ -f "$INPUT_PROJECT_ROOT/$report" ]; then
+      resolved="$INPUT_PROJECT_ROOT/$report"
+    elif [ -f "$report" ]; then
+      resolved="$report"
+    else
+      echo "::error::junit-report '$report' not found. Point it at the report your test step wrote, relative to project-root."
+      exit 1
+    fi
+    ATTEST_ARGS=("attest-tests" "--junit" "$resolved" "--project-root" "$INPUT_PROJECT_ROOT")
+    if [ -n "$INPUT_ATTESTATION_ENV" ]; then
+      ATTEST_ARGS+=("--env" "$INPUT_ATTESTATION_ENV")
+    fi
+    # Coverage with contexts, so each test records what it reached. Same
+    # resolution as the report: relative to project-root first.
+    if [ -n "${INPUT_COVERAGE_REPORT:-}" ]; then
+      if [ -f "$INPUT_PROJECT_ROOT/$INPUT_COVERAGE_REPORT" ]; then
+        ATTEST_ARGS+=("--coverage" "$INPUT_PROJECT_ROOT/$INPUT_COVERAGE_REPORT")
+      elif [ -f "$INPUT_COVERAGE_REPORT" ]; then
+        ATTEST_ARGS+=("--coverage" "$INPUT_COVERAGE_REPORT")
+      else
+        echo "::error::coverage-report '$INPUT_COVERAGE_REPORT' not found. Point it at the JSON that 'coverage json --show-contexts' wrote, relative to project-root."
+        exit 1
+      fi
+    fi
+    if [ -n "$INPUT_ATTESTATION_SIGNING_KEY" ]; then
+      ATTEST_ARGS+=("--signing-key" "$INPUT_ATTESTATION_SIGNING_KEY")
+    fi
+    if [ -n "$INPUT_SIGSTORE_TUF_URL" ]; then
+      ATTEST_ARGS+=("--sigstore-tuf-url" "$INPUT_SIGSTORE_TUF_URL")
+    fi
+    if [ -n "$INPUT_SIGSTORE_TRUST_CONFIG" ]; then
+      ATTEST_ARGS+=("--sigstore-trust-config" "$INPUT_SIGSTORE_TRUST_CONFIG")
+    fi
+    mipiti-verify "${ATTEST_ARGS[@]}"
+  done
+fi
+
+# Dependence and reach are the two opt-in steps that run tests: each named
+# test once, with its mechanism disabled (dependence) or alone under
+# coverage (reach), in this job. Nothing below these blocks executes
+# project code.
+run_options() {
+  if [ -n "${INPUT_RUNNER:-}" ]; then
+    RUN_ARGS+=("--runner" "$INPUT_RUNNER")
+  fi
+  if [ -n "${INPUT_RUN_CMD:-}" ]; then
+    RUN_ARGS+=("--run-cmd" "$INPUT_RUN_CMD")
+  fi
+  if [ -n "${INPUT_COVERAGE_CMD:-}" ]; then
+    RUN_ARGS+=("--coverage-cmd" "$INPUT_COVERAGE_CMD")
+  fi
+  if [ -n "${INPUT_COVERAGE_FILE:-}" ]; then
+    RUN_ARGS+=("--coverage-file" "$INPUT_COVERAGE_FILE")
+  fi
+  if [ -n "${INPUT_STRATEGY:-}" ]; then
+    RUN_ARGS+=("--strategy" "$INPUT_STRATEGY")
+  fi
+  if [ -n "${INPUT_BUILD_CMD:-}" ]; then
+    RUN_ARGS+=("--build-cmd" "$INPUT_BUILD_CMD")
+  fi
+  if [ -n "$INPUT_ATTESTATION_SIGNING_KEY" ]; then
+    RUN_ARGS+=("--signing-key" "$INPUT_ATTESTATION_SIGNING_KEY")
+  fi
+  if [ -n "$INPUT_SIGSTORE_TUF_URL" ]; then
+    RUN_ARGS+=("--sigstore-tuf-url" "$INPUT_SIGSTORE_TUF_URL")
+  fi
+  if [ -n "$INPUT_SIGSTORE_TRUST_CONFIG" ]; then
+    RUN_ARGS+=("--sigstore-trust-config" "$INPUT_SIGSTORE_TRUST_CONFIG")
+  fi
+}
+
+if [ -n "${INPUT_DEPENDENCE_PAIRS:-}" ]; then
+  RUN_ARGS=("attest-dependence" "--project-root" "$INPUT_PROJECT_ROOT")
+  for pair in $INPUT_DEPENDENCE_PAIRS; do
+    RUN_ARGS+=("--pair" "$pair")
+  done
+  if [ -n "${INPUT_SUITE_CMD:-}" ]; then
+    RUN_ARGS+=("--suite-cmd" "$INPUT_SUITE_CMD")
+  fi
+  if [ -n "${INPUT_SUITE_JUNIT:-}" ]; then
+    RUN_ARGS+=("--suite-junit" "$INPUT_SUITE_JUNIT")
+  fi
+  run_options
+  mipiti-verify "${RUN_ARGS[@]}"
+fi
+
+if [ -n "${INPUT_REACH_PAIRS:-}" ]; then
+  RUN_ARGS=("attest-reach" "--project-root" "$INPUT_PROJECT_ROOT")
+  for pair in $INPUT_REACH_PAIRS; do
+    RUN_ARGS+=("--pair" "$pair")
+  done
+  # Suite mode: one whole-suite run; the record is suite-level reach
+  # (reach_scope = suite), which never establishes per-test reach.
+  if [ -n "${INPUT_SUITE_CMD:-}" ]; then
+    RUN_ARGS+=("--suite-cmd" "$INPUT_SUITE_CMD")
+  fi
+  run_options
+  mipiti-verify "${RUN_ARGS[@]}"
+fi
+
 ARGS=("run")
 
 if [ -n "$INPUT_MODEL_ID" ]; then
-  ARGS+=("$INPUT_MODEL_ID")
+  # Positional argument; appended behind "--" once every option is in
+  # place, so the id is passed as an operand whatever it starts with.
+  MODEL_ID="$INPUT_MODEL_ID"
 elif [ "$INPUT_ALL" = "true" ]; then
   ARGS+=("--all")
 else
@@ -28,6 +153,20 @@ fi
 
 if [ -n "$INPUT_TIER2_MODEL" ]; then
   ARGS+=("--tier2-model" "$INPUT_TIER2_MODEL")
+fi
+
+if [ -n "$INPUT_TIER2_CONSISTENCY_N" ]; then
+  ARGS+=("--tier2-consistency-n" "$INPUT_TIER2_CONSISTENCY_N")
+fi
+
+# The provider key is handed only to the SDK of the provider selected:
+# each SDK reads its own variable, and the one for a provider that is
+# not in use has no reader in this process.
+if [ -n "$INPUT_TIER2_API_KEY" ]; then
+  case "$(printf '%s' "$INPUT_TIER2_PROVIDER" | tr '[:upper:]' '[:lower:]')" in
+    openai)    export OPENAI_API_KEY="$INPUT_TIER2_API_KEY" ;;
+    anthropic) export ANTHROPIC_API_KEY="$INPUT_TIER2_API_KEY" ;;
+  esac
 fi
 
 if [ "$INPUT_REVERIFY" = "false" ]; then
@@ -60,6 +199,21 @@ fi
 
 if [ "$INPUT_REQUIRE_ATTESTATION" = "true" ]; then
   ARGS+=("--require-attestation")
+elif [ "$INPUT_DRY_RUN" != "true" ] \
+  && [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] \
+  && [ -z "$INPUT_WORKSPACE_SIGNING_KEY" ] \
+  && [ -z "${MIPITI_WORKSPACE_SIGNING_KEY:-}" ] \
+  && [ -z "${MIPITI_CUSTOMER_SIGNING_KEY:-}" ]; then
+  # No signer can be reached from this job: the runner exposes no OIDC
+  # token (the job lacks `id-token: write`) and no signing key is
+  # configured. The run still submits, unsigned, as it always has; the
+  # annotation makes that visible in the job summary instead of only in
+  # verbose output.
+  echo "::warning title=Unsigned submission::No attestation signer is available (no OIDC token — grant 'id-token: write' — and no workspace-signing-key), so results are submitted unsigned. Set 'require-attestation: true' to fail the run instead."
+fi
+
+if [ -n "${MODEL_ID:-}" ]; then
+  ARGS+=("--" "$MODEL_ID")
 fi
 
 exec mipiti-verify "${ARGS[@]}"

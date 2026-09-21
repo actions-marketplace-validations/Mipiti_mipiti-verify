@@ -7,6 +7,674 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Two assertion types whose pass is a statement about EVERY site in a declared
+  scope rather than about one place. `sink_default_deny`: over every source
+  file in `scope`, every site of a declared sink receives, at each guarded
+  position, only a form the declared `safe_forms` vocabulary accepts, or is an
+  allowlisted site with a reviewed reason. `typed_boundary`: every guarded sink
+  position receives a value built through a declared constructor of
+  `boundary_type`, and every construction site of that type takes only literal
+  or named-constant arguments. A sink is a call, a constructor, a macro
+  invocation, a store to a named target or a module instantiation, so a
+  hardware description is read by the same rules as a software source
+  (Verilog, SystemVerilog and VHDL alongside Python, JavaScript, TypeScript,
+  Go, Rust, Java, Kotlin, C, C++, C#, Ruby, PHP and Swift).
+
+  What makes the verdict worth something is what the check refuses. A pass is
+  returned only when every site in the declared scope was examined and each
+  one proved safe, so everything that leaves a part of the scope unexamined is
+  a refusal: a scope that matches nothing; a file it cannot read, whose
+  extension names no language, that the parser rejects, or in a language this
+  install has no parser for (reading a language other than Python needs the
+  `ast` extra; the refusal names it); a link anywhere in the region an entry
+  searches, matched or not, since a pattern walk does not descend through a
+  linked directory and a linked file names content under a path the tree does
+  not own; a scope over 5,000 files, over 2 MiB in one file, or over 16 MiB in
+  total, all of which arrive as "narrow it" rather than as a job the machine
+  killed; and a chain of functions forwarding into a sink deeper than 12 hops,
+  where the sink set had not closed when the budget ran out. Every site it
+  could not classify counts as a violation, as does reflection, dynamic
+  evaluation, a macro body naming a sink, a shell invocation built from a
+  variable, and a sink handed on as a value. Import and assignment aliases,
+  and in-scope wrappers that forward a parameter into a guarded position, are
+  sinks themselves, closed to a fixpoint. An allowlist entry must name a file,
+  a site, a callee, a reason and a reviewer and must match a site the check
+  actually flagged; a stale entry fails the run, the allowlist content sits
+  inside the evidence hash so editing it reopens review, and no entry
+  suppresses a scope or parse refusal. An exception excepts a site the run
+  examined, so the list cannot be longer than the sites in scope, and a run
+  whose every flagged site is an exception -- with nothing anywhere in the
+  scope admitted by form -- has decided nothing mechanically and is refused
+  as vacuous. A safe form is decided from the value and never from where it
+  sits: `parameter_binding` names a data structure written at the site every
+  element of which is itself an admitted form, so a structure holding an
+  interpolation, a name that is not a constant, a call or another structure
+  is a violation, and so is one no element could be read from. What a callee
+  does with a value it accepts is a property of the callee and is not read,
+  so a sink taking bound values in a later argument is declared by naming the
+  statement position in `positions`, which leaves the data positions
+  unguarded. The one residual -- a
+  sink reached under a name in neither `sinks` nor `wrappers` -- is stated in
+  the result and is what the semantic tier reviews, over the inventory the
+  mechanical tier built rather than by re-scanning.
+
+  A verdict's details carry the counts, the refusal reasons and a per-parser
+  file count, and stay inside the size a result may be submitted at whatever
+  the submission holds: a per-site listing beyond that budget is dropped with
+  a line saying how many were left out, a refusal states its first reasons
+  and then how many it did not list, and the whole string is cut to the bound
+  as a last resort, so one oversized row can never reject the batch it
+  travels in. The counts stay complete. Paths in a verdict are
+  repository-relative, so a filesystem error contributes its reason and never
+  the checkout's location on the machine that ran it. Within one invocation a
+  scope is read and parsed once for both the verdict and the inventory the
+  semantic tier is shown.
+
+  Two of those counts travel further than the details. How many sites of the
+  declared sinks a run decided, and how many of those stand on a reviewed
+  exception rather than on a form it admitted, are reported as data on the
+  submitted result of every tier-1 run of these two types. A claim about every
+  site in a scope is worth what its enumeration is worth, so a reader deciding
+  whether to rely on one is handed the size of it rather than a sentence to
+  take on trust. A refused run states them too -- a run that examined nothing
+  reports nothing examined, so an earlier run's numbers can never stand in for
+  a later run that established none -- and neither number is ever read from
+  the assertion, since a count of what a run examined is a fact only that run
+  holds. Every other type states neither: absent is not zero, it is a question
+  that run did not answer.
+
+- `attest-construction` and `attest-allowlist-review`: two signed statements
+  for the facts a repository cannot settle on its own. The first compiles
+  probes that build a boundary type from something that is not a literal and
+  records the ones the toolchain refused (a probe that compiles writes
+  nothing and exits non-zero; probes are compiled, never run). The second
+  records the reviewed exceptions and who stands behind them at this commit.
+  A probe the toolchain never answered on -- no tool installed, no project
+  file above the source, a command that would not start or ran out of time --
+  is reported as an absent answer and signs nothing, since only the
+  toolchain's own rejection of a probe is evidence about the type.
+  Neither changes a verdict; each replaces "on the author's word" with "in a
+  signed statement" in the facts a reader sees. Both kinds are declared in
+  `schemas/test-result-v1.schema.json`, and neither evidences that a test ran.
+
+- Every assertion type now declares the CLASS of fact its verdict reports --
+  `presence`, `under_approximating_scan`, `existential_witness`,
+  `sound_over_approximation` or `by_construction` -- at the one place the type
+  is registered, so no reader infers strength from a type's name, its
+  parameters or a file path. A test file existing, and a symbol inside one,
+  are `presence`: they prove something exists, never that it ran. The
+  vocabulary and the per-type class are held equal to the assertion-type
+  catalogue by `formal/check_types.py` (T5, T7), which also holds the sink
+  vocabulary equal across the two declarations (T8: the safe forms and the
+  sink kinds, each put through the engine's own params reader), and
+  `formal/check_sound.py` proves over a grammar of programs that the sound
+  engine's flagged set contains every unsafe site, self-validating that each
+  of its enumeration features is load-bearing and naming the programs it
+  refuses on purpose -- those whose safety would rest on a fact about the
+  callee -- so a build that started passing one would fail the checker.
+
+- A `mechanism_found` fact on a `test_attested` result, and in the facts block
+  the semantic tier is shown: whether the named mechanism resolves to a
+  definition in the checkout. A mechanism that cannot be located leaves every
+  claim about it unresolvable, which now reads as a stated fact rather than as
+  two unexplained unknowns.
+
+- Pattern matching in the sound-witness engine runs on the linear-time
+  engine the rest of the package uses, so a name taken from a source file
+  cannot cost a run more than the text it scans, and the structural proof
+  that no verifier reaches for the backtracking one covers this module too.
+  The pipeline checker that carries that proof now runs under the test suite
+  rather than only as its own step.
+
+- Tier-2 self-consistency and evidence-keyed verdict reuse, so a nondeterministic judge cannot flicker a control's verified status between runs. Each fresh evidence is judged N times (N=3 default; `--tier2-consistency-n` / `tier2-consistency-n` input / `MIPITI_TIER2_CONSISTENCY_N`) and the spread decides: a PASS requires every judgment to agree, a unanimous fail is a confident fail, an all-inconclusive vote is skipped, and anything else is a split — reported not verified and deliberately not cached, so a borderline verdict is never frozen into a lucky green. Each verdict is keyed by a hash of exactly what the judge is shown (assertion type, params, assembled source, subject kind, the per-type template bytes, provider and model); when the platform returns a stored verdict for an unchanged hash the runner reuses it with no judge call. A confident assertion converges to a cached pass over a run or two; a genuinely borderline one never caches green.
+
+### Fixed
+
+- A tier-2 verdict whose judgments disagreed is kept, rather than discarded
+  and put to the judge again on the next run. A pass still requires every
+  judgment to agree, and a split still verifies nothing; what changes is that
+  it now carries its evidence hash like any other verdict, so the same
+  unchanged question is not asked repeatedly. It is reported `skipped` rather
+  than `failed`, because judgments disagreeing is not a finding that the
+  evidence is bad.
+
+- The number of judgments a verdict was reached over travels with it, so
+  `--tier2-consistency-n` acts on assertions that already have one: a run
+  asking for more scrutiny than a stored verdict carries judges again and
+  replaces it, and a run asking for the same or less reuses it.
+
+- `--rejudge <assertion_id>` judges one assertion again even where a stored
+  verdict matches its evidence. Repeatable, and deliberately per-assertion:
+  it is the way to get a second reading on a verdict reached from judgments
+  that disagreed, without editing evidence solely to clear it.
+
+- A tier-2 verdict is keyed on the evidence, not on where that evidence sits
+  in its file. The judge for `function_exists` and `class_exists` is handed the
+  isolated definition block — existence is settled mechanically and the
+  semantic tier is told it is not being asked to locate the symbol — so an
+  edit anywhere else in the file leaves the code it reasons over identical.
+  The mechanical tier's facts block names the target's location, and that text
+  was folded into the hashed evidence, so such an edit changed the key and the
+  assertion was re-judged at full cost with nothing about the question having
+  changed. The fact the block states is still part of the key; the line number
+  is not. The schema version moves with it, so every stored verdict is
+  recomputed once.
+
+- A run signs with an identity minted when it signs, not one taken at
+  startup. A workload identity token is short-lived, and a verification run
+  spends as long as its evidence takes between starting and signing its first
+  statement, so on a repository of any size the token was reliably expired
+  before it was ever used and the run lost its attestation every time — a
+  hard failure where `--require-attestation` is set. The credential that mints
+  tokens stays valid for the whole job, so one obtained at the point of use
+  cannot have aged out in between. Detection still happens at startup, which
+  is what lets a run know signing is possible before producing something to
+  sign; an explicitly supplied token is used as given, since re-minting would
+  substitute an identity the caller did not choose. The two other signing
+  entry points already minted at the point of use and are unchanged.
+
+- An expired identity token now says it expired. The validator answers
+  "malformed or missing claims" for every rejection, expiry included, so a
+  stale token sent a reader looking for a broken one. The expiry claim is read
+  without verifying the signature and only to word the message; nothing is
+  trusted on the strength of it, and an unreadable token adds nothing.
+
+- One `audit-tlc-all` context stands for the whole audit-tlc matrix, reading
+  the matrix job's own result, which is success only when every config
+  succeeded. The required set is stated once instead of being a list of config
+  names kept in step by hand with a matrix that grows, so a config added later
+  is covered by construction. A skip counts only where the change guard
+  answered and said the diff is prose; a cancelled matrix, or a guard that
+  could not answer, fails.
+
+- Markdown-only pull requests are handled inside the one workflow that
+  publishes the check contexts, rather than by a second workflow posting the
+  same job names. Two workflows can publish one set of contexts only while
+  exactly one of them runs, and trigger path filters cannot express that:
+  `paths-ignore` suppresses a run when every changed file matches while
+  `paths` starts one when any does, so a change touching prose and code
+  satisfies both. GitHub's guidance is to keep job names unique across
+  workflows for this reason. The saving the split existed for is kept: a
+  prose-only diff still skips the suite and the specs, now on a verdict the
+  change guard states rather than on a trigger filter that cannot express it.
+
+- The end-to-end mutation tests for Verilog and VHDL now run in CI instead of
+  reporting as skipped. Every other language a source mutation checks is
+  checked with the tool that also runs that project's tests -- `cargo check`
+  beside `cargo test`, `go build` beside `go test` -- so the analyser cannot
+  plausibly be absent where verification is meaningful. Verilog and VHDL are
+  the exception: a team on a commercial simulator has none of verilator,
+  slang, iverilog, ghdl or nvc, which makes the missing-analyser branch the
+  one with a live failure mode and the one the suite was not reaching. A VHDL
+  case joins the two Verilog ones, driving whichever analyser is installed
+  exactly as the compile gate does. `MIPITI_TEST_REQUIRE_TOOLCHAINS` names the
+  tools a caller undertakes to provide and fails when one is absent, so a job
+  that stops installing them says so rather than going quietly back to
+  skipping.
+
+- A JavaScript or TypeScript mechanism run through the command runner is
+  refused with the reason it is refused for, instead of being rewritten on
+  disk and then failed against a check that does not exist. The set of
+  languages disabled by rewriting their source was read off the table of
+  aborting bodies, which also carries the bodies the node adapter injects at
+  runtime; that swept JavaScript and TypeScript into the command runner's
+  mutation set, where no compile check is defined for them. Such a pair
+  demanded a clean git checkout, wrote the file, and then always errored with
+  `mutated tree does not compile` for a tree that compiled — no input could
+  make it succeed. The mutation set is now stated rather than derived, so the
+  pair is refused before the file is touched and the message names the runner
+  that does disable these at runtime. The outcome was `error` throughout, so
+  nothing was ever credited that should not have been.
+
+- The semantic judge is no longer asked to locate what the mechanical tier
+  already located. A `test_attested` assertion whose mechanism is imported
+  rather than defined (a framework middleware class, say) showed the judge
+  a mechanism section reading "not found", and the judge answered in kind;
+  it now shows the sites in the file that reference and configure the
+  symbol. Every presence-type prompt ends with the mechanical tier's own
+  finding ("defined at line 131", "pattern found"). When a not-found
+  refusal is still set aside, the recorded details carry the structural
+  finding and the judge's reasoning, so the cause is readable instead of
+  a bare "unanswered".
+
+### Fixed
+
+- An absence assertion (`pattern_absent`, `no_plaintext_secret`) can pass
+  tier 2. Its templates asked the presence question ("lack of visible
+  evidence is never YES") and offered a `NOT_FOUND` reason that, for a
+  target expected to be absent, restated the structural result; the
+  runner then set the verdict aside as a contradiction and the assertion
+  stayed pending, so a control whose clause is provable only by an
+  absence could never reach verified. The templates now ask whether the
+  confirmed absence proves the aspect (the regex could be too narrow, the
+  behaviour reachable another way, the file the wrong place), offer only
+  a `QUALITY` reason, and say the scan covered the whole subject when the
+  judge sees an excerpt. Absence types are exempt from the not-found
+  discard, so a stray one is a plain refusal rather than a permanent skip.
+- The `test_attested` template says outright that an unmeasured fact
+  ("reached mechanism: unknown") is never a ground for NO.
+
+### Changed
+
+- A scope entry that is itself a link, or that passes through one, is refused
+  the same way a link inside the searched region already was. The check runs
+  before the path is resolved, because resolution is where a link stops being
+  distinguishable from a real directory — after it the walk enumerates the
+  target's tree while the scope still reads as the name that was declared. A
+  declared scope has to name the tree that was read.
+
+- Formal checks in CI take a third of the time. `audit_bundle_bind.cfg`
+  and `audit_main_orphan_legacy.cfg` are split per `key_source` class
+  (`audit_bind_*.cfg`, `audit_main_orphan.cfg`, `audit_main_legacy.cfg`),
+  each its own matrix job, since TLC enumerates a spec's initial states
+  on one thread; the partition checker asserts the Config-2 split is total
+  and disjoint. The audit-spec implementation sweep runs its rows across a
+  fork pool and hands every row a pinned Sigstore trust root instead of
+  refreshing it per row.
+
+### Fixed
+
+- A dependence pair that recorded no outcome now says why in the verifier's
+  details (`fails without mechanism: not established (<reason>)`), and the
+  refusal outside a git checkout names the alternatives (`--strategy hook`;
+  runtime disabling for Python and JavaScript). The README states the git
+  requirement of source mutation.
+- `run --all` reports on the models bound to the repository it runs in. A
+  model whose description provenance names another repository is skipped
+  with one notice. One that names this repository has every coverage gap
+  reported, evidence or not. One that names none, and has no assertion
+  bound to this repository, gets a single line saying so instead of one
+  warning per control; the report carries `repo_bound_assertions`.
+- `MIPITI_ATTESTATION_DIR` names where attestations are written and read
+  (default `.mipiti/attestations` under the project root). The action sets
+  it to a directory of its own when the checkout is not writable by the
+  container's user, so no `chmod` of the workspace is needed.
+- `formal/check_adapters.py` without the parser extra: the properties that
+  need a parser (mutation confinement, the drive for the compile and
+  clean-tree gates, the parser-versus-fallback comparison) are reported
+  not established instead of failing or aborting; the runtime's refusal to
+  mutate what it cannot isolate is unchanged.
+
+### Added
+
+- A source mutation runs only on a definition the language layer isolates
+  exactly (`scope: symbol`, from a parser or the HDL keyword scanner). A
+  span the line heuristic can only offer as a `block` may be a different
+  definition, and a mutation of the wrong block can still compile, so the
+  pair is `error` with reason `definition not isolated exactly (install
+  mipiti-verify[ast] or nominate a unique symbol)`. Formal property A8 in
+  `formal/check_adapters.py`.
+
+- Command output (test runs, suite runs, coverage runs, compile checks) is
+  streamed to a temporary file and only its last 64 KiB read back for a
+  reason string, so memory stays bounded whatever a harness prints.
+
+- The end-to-end runner tests that wrap a toolchain in `sh -c` skip on a
+  runner without a POSIX shell.
+
+- Property-based checks (`hypothesis`, in the `dev` extra) over the
+  definition locators and the coverage readers: `locate` never raises on
+  arbitrary text and every span it returns is the file's own lines
+  carrying the name; `hash_of` ignores line endings and trailing blanks and
+  nothing else; the HDL keyword scanner never raises and its blocks nest;
+  `read_coverage` returns a report or its own error on any bytes, with only
+  positive line numbers under normalised repository-relative paths;
+  `parse_junit` returns a summary or its own error. Three findings fixed
+  along the way: a deeply nested Python file no longer escapes as
+  `MemoryError` from the parser, a coverage path with a `..` segment is
+  folded (and dropped when it climbs out of the root) instead of kept
+  verbatim, and a negative line number in a coverage.py export is ignored
+  like a zero.
+
+- `attest-reach --suite-cmd "<command>" --coverage-file <report>` (action:
+  `suite-cmd` with `reach-pairs`): reach for a harness that cannot run one
+  test alone. The suite runs once under coverage and every nominated test
+  records what the suite executed in its mechanism's file as
+  `suite_reached`, with `predicate.reach_scope = "suite"` (schema: optional
+  `reach_scope`, `test` | `suite`; per-test records now carry `test`).
+  Stated for what it is: per-test reach is undefined for such a harness,
+  so a suite-scope record is information and never yields `reached`. The
+  verifier's details line and the tier-2 facts block read
+  `reached mechanism: unknown (suite-level coverage only)` when that is
+  all there is. `formal/check_evidence_records.py` gains a suite-scope
+  reach axis (8 axes, 15120 combinations) showing R3 never sets the fact
+  from it.
+
+- `attest-dependence` stubs a Verilog / SystemVerilog `module` declared in
+  the non-ANSI style (`module m(a, y); input a; output y; ...`): the
+  header is kept, the body's port declarations are re-emitted verbatim
+  (directions, `wire` / `reg` / `logic`, packed ranges, `signed`, comma
+  lists), every `output` is driven to `x` (`assign` for a net, an
+  `always_comb` / `always @*` block for a variable), and the stub ends
+  with `endmodule`. The declarations are read with the grammar when the
+  `[ast]` extra is installed and by the keyword scanner otherwise. A port
+  the header names without a declaration in the body, or a declaration
+  naming a port the header does not list, is `error` with the reason.
+
+- `no_plaintext_secret` refuses an empty or omitted `patterns` list: an
+  absence check names what it checked for, or it establishes nothing.
+
+- Formal checks over every verifier, every assertion type, the composition
+  of test-evidence records, and every runner adapter
+  (`formal/check_verifiers.py`, `formal/check_types.py`,
+  `formal/check_evidence_records.py`, `formal/check_adapters.py`), each exhaustive over its space and
+  cross-checked against an independent oracle: a structural verifier passes
+  only when its condition holds and fails closed otherwise; a type is stated
+  consistently across the catalogue, its verifier's parameter reads, its
+  tier-2 template and its evidence class; a mutated source file is restored
+  byte-for-byte, changed only within the named definition, compile-checked
+  before the test runs, and refused when the working tree is dirty; a
+  `test_attested` pass comes only from a test-result record at the commit,
+  and the reach and dependence facts only from a record that was actually
+  run at that commit for that mechanism. Each
+  runs as an ordinary test, so CI runs them on every push. The verifier
+  registry now states each type's evidence class (`presence` or
+  `behavioral`) via `EVIDENCE_CLASS` / `evidence_class()`.
+- Test-result attestations carry each test's definition: `attest-tests`
+  locates every recorded test in the checkout and records its `file` and a
+  `definition_sha256` over the definition block (or the file, marked
+  `definition_scope: "file"`, when the block cannot be isolated). The
+  `test_attested` result reports it as `evidence_hash`, so the platform can
+  bind acceptance to the test as written.
+- `attest-tests --coverage <coverage.py JSON with contexts>` records, per
+  test, the files and lines it reached. When a `test_attested` assertion names
+  a `mechanism` (`<file>::<symbol>`), the result reports `reached: true|false`
+  from that record.
+- `attest-dependence`, a new opt-in command for the job that already runs
+  tests: each `(test, mechanism)` pair is run once with the mechanism replaced
+  by a stub and the outcome is signed into a dependence attestation
+  (`predicate.kind = "dependence"`). The `test_attested` result reports
+  `depends: true|false` when such a record names the test and mechanism at
+  the commit under verification. This command runs tests; `run` still
+  executes nothing. Pairs come from `--pair` or `--from-model`.
+- Tier-2 review of a `test_attested` assertion reads the test's definition
+  from the checkout, the named mechanism's definition, and a facts block
+  (definition hash match, reached, fails without); the criterion answers NO
+  when the facts show the test never reached, or does not depend on, the
+  mechanism.
+- Test-backed assertions (`test_attested`, `test_exists`, and
+  `function_exists` / `class_exists` on a test file) are always verified under
+  `--changed-files`: a test's subject is the code it exercises, not its own
+  file.
+- The predicate schema gains the optional per-test fields `file`,
+  `definition_sha256`, `definition_scope`, `reached`, `fails_without` and the
+  optional `kind`. No version bump; absence means "not recorded".
+- Definition location for every supported language. `attest-tests` cuts a
+  test's definition with Python's `ast`, with tree-sitter for JavaScript,
+  TypeScript, Go, Rust, Java, Kotlin, C, C++, C#, Ruby, PHP, Swift, Verilog,
+  SystemVerilog and VHDL when the new optional extra `mipiti-verify[ast]`
+  (`tree-sitter-language-pack`, also in `[all]`) is installed, with a
+  keyword-pair block scanner for the HDLs when it is not, and with the brace
+  / indentation block otherwise. Each test entry now always records
+  `definition_scope` (`symbol`, `block` or `file`) and, unless the scope is
+  the file, `parser` (`ast`, `tree-sitter`, `keyword`, `lines`), so a reader
+  knows what the hash covers and how the span was found.
+- The `mechanism` of a `test_attested` assertion may name its kind:
+  `<file>::<kind>:<name>` (`rtl/alu.sv::module:alu`,
+  `rtl/fsm.sv::always:seq_logic`); a bare name is tried as a function, then a
+  class, then each HDL kind in a fixed order. Reach is computed against the
+  span the file's language resolves. The kinds are one vocabulary
+  (`languages.definitions.MECHANISM_KINDS`, equal to the catalogue's), read by
+  the locator, the disable adapters and the verifier alike; `struct` and
+  `impl` locate as `class`.
+- `attest-tests --coverage` reads LCOV (`.info` / `.lcov`, including
+  `verilator_coverage --write-info` output), Cobertura XML and JaCoCo XML in
+  addition to coverage.py JSON, detected from content, and accepts a
+  directory of one report per test (`<test id>.<ext>`, `::` spelled `__`).
+  A report that attributes lines to tests records `reached` per test; an
+  aggregate report (any format, or coverage.py without contexts) is no longer
+  refused: it records `suite_reached` per test and leaves `reached` absent,
+  because a suite-wide report cannot say what one test executed.
+- The predicate schema gains the optional per-test `parser` and
+  `suite_reached`; `definition_scope` accepts `symbol` and `block`.
+- Action inputs `coverage-report` and `dependence-pairs`.
+- Runner adapters (`languages/adapters/`) behind `attest-dependence` and the
+  new `attest-reach`: pytest (also cocotb suites driven by pytest), jest,
+  vitest, mocha, `go test -run`, `cargo test`, Maven (`-Dtest=`), Gradle
+  (`--tests`), `dotnet test --filter`, rspec, phpunit, and a command runner
+  (`--run-cmd "make sim TEST={test}"`, `--coverage-cmd`, `--coverage-file`)
+  for simulators and custom harnesses. Detected from the project's files,
+  the mechanisms' language breaking a polyglot tie; `--runner` overrides.
+  Every adapter selects exactly one test, maps the runner's exit status so a
+  run that selected nothing, failed to build, could not start or timed out is
+  `error` with a reason (never `failed`), and runs the test under the
+  language's coverage tool.
+- Dependence for every supported language. A JavaScript or TypeScript
+  mechanism is disabled by a setup file registered for the run (jest
+  `--setupFilesAfterEnv`, a temporary vitest config extending the project's
+  with a `setupFiles` entry, mocha `--require`) that mocks the module by its
+  resolved path and replaces the export (`default`, a function, or
+  `Class.method` on the prototype) with a function that throws. Go, Rust,
+  Java, Kotlin, C, C++, C#, Swift, Verilog, SystemVerilog and VHDL mechanisms
+  are disabled by source mutation: the definition's body is replaced by one
+  that aborts (a Verilog `module` by a stub with the same ANSI header whose
+  outputs are driven to `x`, a `function`/`task` by `$fatal`, a labelled
+  block, `property`, `sequence` or `assert` removed; a VHDL `architecture`
+  emptied, a `process` removed, a `function`/`procedure` by `assert false`),
+  the tree is compile- or lint-checked first with the language's toolchain,
+  the file is refused when it has uncommitted changes, and the original
+  bytes are restored afterwards and verified by hash. A compile failure, a
+  refused file or a mechanism that cannot be disabled records `error` with
+  the reason in `fails_without[].reason`, which the verifier reads as
+  unknown.
+- `attest-reach`: runs each nominated test alone under coverage through the
+  runner adapter and signs the lines it executed in the mechanism's file
+  into a `predicate.kind = "reach"` attestation (`-reach` suffix), in the
+  same per-test `reached: [{file, lines}]` shape `attest-tests --coverage`
+  records. Only the mechanism's file is kept. Same pair sources
+  (`--pair`, `--from-model`), same `--timeout` / `--total-timeout` budget
+  (unrun pairs recorded as `error` with a reason), same signing ladder as
+  `attest-dependence`. Go `-coverprofile`, SimpleCov `.resultset.json` and
+  Clover XML are converted to LCOV; JaCoCo and Cobertura are read as they
+  are.
+- Action inputs `reach-pairs`, `runner`, `run-cmd`, `coverage-cmd` and
+  `coverage-file`; `dependence-pairs` is no longer Python-only.
+- `--strategy hook` on `attest-dependence` and `attest-reach` (default stays
+  `mutation`): a second dependence strategy for compiled codebases that
+  build once. The repository places a tripwire inside each mechanism's own
+  body, gated out of production by a build flag (Go tag / Rust feature
+  `mipiti_hooks`, C/C++ and Swift `MIPITI_HOOKS`, Verilog `` `MIPITI_HOOKS ``,
+  a VHDL generic; Java/Kotlin compiled always, inert), that aborts with
+  `mipiti-hook <file>::<symbol> at <file>:<line>` only when
+  `MIPITI_DISABLE_MECHANISM` equals its own id. The go runner builds one
+  test binary per package with `go test -c -tags mipiti_hooks`, cargo with
+  `cargo test --no-run --features mipiti_hooks`, the command runner with a
+  new `--build-cmd`, then each pair runs with its mechanism named; no
+  source is rewritten and the tree need not be clean. Two mandatory checks
+  are recorded: the location proof (dependence is credited only when the
+  marker for this mechanism lies inside its exactly located definition,
+  recorded as `fails_without[].hook_location`; a failure without the marker
+  or with one outside the span is `error` with the reason) and a control
+  run (every nominated test once with a value no hook answers to, recorded
+  as `control_run`; any failure records `error` for every pair and stops).
+  The record carries `strategy: "hook"`. pytest, jest, vitest and mocha
+  refuse the strategy with a reason pointing at their runtime disable.
+  Action inputs `strategy` and `build-cmd`.
+- `attest-dependence --suite-cmd "<command>" --suite-junit <report>`:
+  dependence from a whole-suite run, for simulators and any harness that
+  cannot select one test. Pairs are grouped by mechanism; each mechanism is
+  disabled in turn through the runner's strategy (same compile/lint gate,
+  same byte-exact restore), the suite command runs once, and the JUnit
+  report it wrote gives every nominated test its outcome. A skipped test
+  records `error` with reason `skipped under mutation`, an absent one
+  `not in report`, a run that wrote no report `no report`, and a failed
+  gate its reason, for every pair on that mechanism. `--timeout` applies
+  per suite run and `--total-timeout` across mechanisms. Same
+  `kind: "dependence"` attestation. Action inputs `suite-cmd` and
+  `suite-junit`. The pytest disable plugin also loads through
+  `PYTEST_PLUGINS`, so a pytest suite command needs no extra flag.
+- `attest-dependence --total-timeout` (default 1800s, also
+  `MIPITI_DEPENDENCE_TOTAL_TIMEOUT`) bounds the whole run; a pair that would
+  start after the budget is spent is recorded as not run, with a `reason`,
+  and reads as unknown rather than as an outcome.
+- `run --test-file-pattern` (also `MIPITI_TEST_FILE_PATTERN`) marks
+  additional paths as test files for the `--changed-files` rule, for
+  repositories whose tests live outside the conventional layouts.
+- Each `test_attested` result submitted to the platform carries the signing
+  class of the attestation it was checked against (`ci_oidc`, `customer_key`
+  or `unsigned`) in a `provenance` field, as data rather than inside the
+  details prose, so the audit envelope and the platform can weigh it.
+- The test-result predicate schema is published at
+  `schemas/test-result-v1.schema.json`, so a producer other than this CLI can
+  emit a conforming attestation.
+- GitLab keyless signing recognises the `id_tokens` job keyword (token
+  exposed as `SIGSTORE_ID_TOKEN`) in addition to the retired `CI_JOB_JWT_V2`,
+  and the pinned identity is the workflow SAN (`project//config@ref`) rather
+  than the bare project URL.
+- README covers the predicate, provenance, running tests and verification in
+  separate jobs, and GitLab setup.
+
+### Changed
+
+- **`test_passes` is replaced by `test_attested`.** Verification is a read-only
+  operation: it reads evidence your project already produced and runs nothing.
+  `test_passes` was the one type that did not fit that rule, so it is removed.
+
+  A test result now reaches verification as a statement your CI signed about a
+  run your own workflow performed. Have your test step write a JUnit report and
+  point the action at it:
+
+  ```yaml
+  - run: pytest --junitxml=report.xml
+  - uses: Mipiti/mipiti-verify@<version>
+    with:
+      all: true
+      junit-report: report.xml
+  ```
+
+  No extra step, nothing to install, and no secret: the attestation is signed
+  keylessly with the run's own OIDC identity, the same way verification runs
+  are already signed. The certificate binds the repository, ref and workflow,
+  so the result carries where it came from. CI with no workload identity signs
+  with `attestation-signing-key` (ECDSA P-256) instead, and CI with neither
+  records the result as self-declared.
+
+  Outside GitHub Actions the equivalent is `mipiti-verify attest-tests --junit
+  report.xml`, run after your tests. Either way the report is read, never
+  produced -- the step that runs your tests is yours.
+
+  Verification pins the signing identity it expects: for a keyless signature,
+  the workflow of the repository being verified; for a key, one the reader
+  configured, never the key carried inside the attestation. Verification then
+  checks the signature, that the attestation covers the commit under
+  verification, that the run selected tests and that they passed, and that the
+  test the assertion names passed in that run.
+
+  The attestation records each test's own outcome, and the named one must be
+  `passed`. Being present in the run says only that the test was collected: a
+  skipped test appears exactly like one that ran, and skipping leaves the
+  failure and error counts at zero, so every aggregate still reads green. The
+  name is matched exactly, so an assertion about `test_auth` is not satisfied
+  by `test_auth_disabled`. A run that selected nothing, or in which everything
+  was skipped, is likewise rejected rather than treated as a pass.
+
+  An attestation can also record the configuration its run ran under, and an
+  assertion can require it:
+
+  ```yaml
+  - uses: Mipiti/mipiti-verify@<version>
+    with:
+      junit-report: report.xml
+      attestation-env: FEATURE_AUTH ENFORCE_TLS
+  ```
+
+  A suite can pass with the control it exercises switched off, and assertions
+  over files in the tree describe the configuration a repository *declares*
+  rather than the one a run *had*. Naming the keys records their values in the
+  signed statement, so `test_attested` can carry an `env` requirement and hold
+  the run to it. Only the names given are recorded, never the whole
+  environment; a nominated key that was unset is recorded as unset, so an
+  assertion can require that a flag was absent; and credential-looking names
+  are refused rather than redacted, since a signed artifact is distributed. A
+  run that recorded nothing cannot satisfy an environment requirement.
+
+  An attestation that names no commit is refused, as is one read where the
+  commit under verification cannot be determined. The binding is what stops a
+  result being replayed against a different tree, and a binding that lapsed
+  whenever either side was missing would not be one.
+
+  An attestation without a signature is accepted and recorded as self-declared
+  only where no verification key is configured. Where one is, an unsigned
+  attestation is refused, so removing a signature cannot lower the bar a result
+  is held to.
+
+  With this change no assertion type executes anything.
+
+### Fixed
+
+- The workflow example in the README pinned `actions/checkout` at v4.3.1, which
+  runs on a Node.js version GitHub now forces onto a newer runtime and has
+  announced for removal. Anyone who copied the snippet inherited the warning on
+  every run. Now pinned to v6.0.2, matching the pin this project's own workflows
+  already use.
+
+- A semantic verdict that arrives with no explanation now records no reason,
+  instead of echoing the verdict token back as one.
+
+  When a response carried nothing after its verdict line, the parser used the
+  whole response as the reasoning — so a bare `YES` was stored as the
+  justification for itself. Downstream that is indistinguishable from a real
+  explanation, and worse than storing nothing: a consumer can render an absent
+  reason honestly, but cannot detect a fabricated one.
+
+  The verdict itself is unaffected; only the recorded reason changes, and only
+  when there was never a reason to record.
+
+### Changed
+
+- The GitHub Action emits a `::warning::` annotation when a run is about to
+  submit unsigned — no OIDC token in the job and no signing key configured.
+  Nothing else changes: the run still submits, and `require-attestation`
+  still defaults to `false`. The README now documents
+  `require-attestation: true` as the recommended setting for CI gates whose
+  results are audited.
+
+- The action passes the `tier2-api-key` value only to the SDK of the
+  provider named in `tier2-provider`, instead of exposing it under both the
+  OpenAI and Anthropic variable names.
+
+- The container image is published under its version tag only; the floating
+  `latest` tag is no longer pushed. `action.yml` pins the image by digest and
+  the README's `uses:` snippet is pinned by commit, so nothing resolves
+  through `latest`. Each published image now carries a build-provenance
+  attestation in the registry, verifiable with
+  `gh attestation verify oci://ghcr.io/mipiti/mipiti-verify@<digest> --owner Mipiti`.
+
+
+### Fixed
+
+- The boundary between the two verification tiers is now enforced in both
+  directions, and across every declaration type rather than two symbol types.
+
+  Whether a criterion holds structurally — a symbol defined, a file present, an
+  import declared, a pattern matched, a dependency pinned — is settled by the
+  structural tier. The semantic tier is a quality gate layered on that fact: it
+  may judge a present target insufficient, and it may not decide the fact
+  itself.
+
+  Previously that was enforced only on entry: the semantic tier was refused
+  when the structural check did not hold. It could still DECLINE a target the
+  structural check had confirmed, on the ground that it could not locate it,
+  which contradicts a settled fact rather than judging quality. Such a verdict
+  is now discarded and the result reported as inconclusive, never converted
+  into a pass — affirming would be the same boundary violation reversed.
+
+  To make this decidable rather than inferred, a refusal now declares its
+  reason (`REASON: QUALITY` or `REASON: NOT_FOUND`) on the line after the
+  verdict. The check reads that declaration and never interprets prose, so a
+  quality refusal that happens to describe something as absent is untouched,
+  and a provider that emits no declaration has its verdicts left as they are.
+
+  The entry check also widens from two symbol types to every declaration type.
+  It stays scoped to verifiers that are pure and cheap, since it re-runs them:
+  types whose verifier executes the code under test are excluded, as running a
+  test suite as a side effect of a semantic check would duplicate work the
+  structural tier already did. Assertions judged against supplied content
+  rather than a repository file are likewise exempt.
+
+
 ### Changed
 
 - The signed attestation payload now carries each assertion's content

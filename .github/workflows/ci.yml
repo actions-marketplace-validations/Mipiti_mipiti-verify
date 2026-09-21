@@ -6,18 +6,25 @@ name: CI
 # duplication. Dropping the push:main trigger saves ~5 min × N
 # bot-auto-merged PRs per release.
 #
-# Markdown-only / CHANGELOG-only PRs skip CI too: tests have no README
-# dependency, so running the full suite for a docs tweak is a waste.
-# Human-authored PRs that DO need CI will change something outside
-# *.md; bot-authored README-update PRs (post-release) only touch
-# README.md and don't need CI at all.
+# Markdown-only PRs still run this workflow, and its jobs report as
+# they always do; what they skip is the suite, via the `docs_only`
+# output below. The filter used to live on the trigger, which meant
+# this workflow did not run at all on a docs PR and a second workflow
+# had to post the same check names so the PR was not blocked waiting
+# for statuses nobody would send. Two workflows publishing one set of
+# contexts is only safe while exactly one of them runs, and that does
+# not hold: `paths-ignore` skips a run when EVERY changed file matches,
+# while `paths` starts one when ANY does, so a PR touching a .md file
+# and code — the shape of most changes here, since the CHANGELOG moves
+# with them — ran both, and every required context was posted twice,
+# once by a job that did the work and once by a job that echoed a line.
+# GitHub calls duplicate contexts ambiguous and does not define which
+# one a required check reads. So the skip moved off the trigger and
+# into the jobs, and this is the only workflow that posts these names.
 
 on:
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'CHANGELOG.md'
 
 jobs:
   # Single shared inert-path determination, consumed (fail-safe) by the
@@ -35,6 +42,11 @@ jobs:
       contents: read
     outputs:
       inert: ${{ steps.guard.outputs.inert }}
+      #: Every changed file is markdown. Narrower than `inert`, which also
+      #: admits workflow files and version-line-only edits: those must still
+      #: run the suite, a prose change need not. This is exactly the set the
+      #: retired docs-only workflow stubbed, so the cost it saved is kept.
+      docs_only: ${{ steps.guard.outputs.docs_only }}
     steps:
       - name: Inert-path guard
         id: guard
@@ -48,9 +60,16 @@ jobs:
             --jq '.files[].path' 2>/dev/null)
           echo "Changed files:"; printf '%s\n' "$files"
           inert=true
-          [ -z "$files" ] && inert=false
+          docs_only=true
+          # No file list means the question could not be asked, so neither
+          # verdict is safe to assert: both fail open and the work runs.
+          [ -z "$files" ] && inert=false && docs_only=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
+            case "$f" in
+              *.md|*/*.md) ;;
+              *) docs_only=false ;;
+            esac
             case "$f" in
               .github/workflows/*|*.md|*/*.md) ;;
               pyproject.toml)
@@ -71,7 +90,9 @@ jobs:
             esac
           done <<< "$files"
           echo "inert=$inert" >> "$GITHUB_OUTPUT"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
           echo "Inert (skip expensive formal jobs/steps): $inert"
+          echo "Docs-only (skip the suite): $docs_only"
           exit 0
 
   test:
@@ -90,7 +111,7 @@ jobs:
     # spec test that needs real Fulcio bundles runs in a separate
     # job (test-spec-invariants) below.
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # CI is read-only: runs tests, formal checks, type-checking. No
           # step does `git push` / `git commit`. Drop the token from
@@ -98,14 +119,14 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
 
       - name: Install pinned dependencies
         run: pip install --require-hashes -r requirements.lock
 
-      - name: pip-audit (all three lockfiles)
+      - name: pip-audit (all four lockfiles)
         # Catches newly-published CVEs against already-pinned versions at
         # PR time. --disable-pip audits the lockfile directly without a
         # separate venv install. The audit tool itself is installed
@@ -143,11 +164,45 @@ jobs:
           pip-audit -r requirements.lock       --disable-pip $IGNORE
           pip-audit -r requirements-build.lock --disable-pip $IGNORE
           pip-audit -r requirements-all.lock   --disable-pip $IGNORE
+          pip-audit -r requirements-dev.lock   --disable-pip $IGNORE
+
+      - name: Install parsers for the definition locators
+        # The formal checkers over definition location (formal/check_adapters.py,
+        # A2/A5 parser arms) and the type checker's catalogue properties need the
+        # optional parser pack and the assertion catalogue; both hash-pinned via
+        # requirements-all.lock / requirements-dev.lock.
+        run: pip install --require-hashes -r requirements-all.lock
 
       - name: Install package and dev extras
-        run: pip install --no-deps -e . && pip install pytest pytest-mock respx
+        run: pip install --no-deps -e . && pip install --require-hashes -r requirements-dev.lock
+
+      # The HDL toolchains, and only those. Every other language a source
+      # mutation checks is checked with the tool that also runs that
+      # project's tests -- cargo check beside cargo test, go build beside
+      # go test -- so it cannot plausibly be absent where verification is
+      # meaningful. Verilog and VHDL are the exception: a team on a
+      # commercial simulator has none of verilator, slang, iverilog, ghdl
+      # or nvc, so the missing-analyser branch is the one with a live
+      # failure mode in the field, and it is the one the suite could not
+      # reach on a runner image that ships none of them.
+      - name: Install HDL toolchains for the end-to-end mutation tests
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.docs_only != 'true' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends iverilog verilator ghdl
 
       - name: Run tests (excluding spec-invariants which needs Fulcio OIDC)
+        # The declared toolchains must be present rather than silently
+        # skipped: a skipif is invisible in a green run, so a runner image
+        # that stopped shipping one would quietly return the suite to the
+        # coverage this step exists to end.
+        # A prose-only change cannot alter what the suite asserts, and this
+        # is the step the retired docs-only workflow existed to avoid. The
+        # job still reports, so the required context is satisfied either
+        # way; fail-safe, so an unanswerable diff runs the suite.
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.docs_only != 'true' }}
+        env:
+          MIPITI_TEST_REQUIRE_TOOLCHAINS: "iverilog vvp verilator ghdl go cc javac"
         run: python -m pytest -v --ignore=tests/test_spec_invariants.py
 
       - name: Formal verification (Python BFS + cross-check)
@@ -189,8 +244,8 @@ jobs:
     # docs/audit-pack-signing.md in the parent repo and
     # formal/audit_manifest.tla in this submodule). The 5 Config-1
     # per-key_source sub-configs (audit_main_sigstore / _platform /
-    # _workspace / _cdsse / _orphan_legacy) + Config-2
-    # (audit_bundle_bind) cover the legacy path; audit_manifest_platform
+    # _workspace / _cdsse / _orphan / _legacy) + the five Config-2
+    # per-key_source sub-configs (audit_bind_*) cover the legacy path; audit_manifest_platform
     # and audit_manifest_workspace cover the manifest path on the two
     # key_source classes where it is the trust anchor. Each matrix
     # instance runs the cheap static checks (AuditView AST
@@ -216,8 +271,12 @@ jobs:
     needs: detect-changes
     # `always()` keeps the matrix running even if detect-changes
     # failed (fail-safe: TLC step inside re-evaluates the verdict and
-    # defaults to running). Each matrix instance is a required check.
-    if: ${{ always() }}
+    # defaults to running). The one case that skips the matrix outright
+    # is a prose-only diff, where even the cheap static checks read code
+    # that did not change; `audit-tlc-all` accepts that skip only under
+    # the same verdict, so a skip for any other reason still fails the
+    # gate. The required context is `audit-tlc-all`, not these.
+    if: ${{ always() && (needs.detect-changes.result != 'success' || needs.detect-changes.outputs.docs_only != 'true') }}
     permissions:
       contents: read
     strategy:
@@ -232,8 +291,13 @@ jobs:
           - audit_main_platform
           - audit_main_workspace
           - audit_main_cdsse
-          - audit_main_orphan_legacy
-          - audit_bundle_bind
+          - audit_main_orphan
+          - audit_main_legacy
+          - audit_bind_sigstore
+          - audit_bind_platform
+          - audit_bind_workspace
+          - audit_bind_orphan
+          - audit_bind_legacy
           # Manifest-signature path (Option β) per-key_source slices.
           # See formal/audit_manifest.tla module comment for the
           # KS_PLATFORM / KS_WORKSPACE partition argument.
@@ -250,12 +314,12 @@ jobs:
           - audit_main_model_only
           - audit_main_sufficiency
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
 
@@ -300,14 +364,59 @@ jobs:
         # standalone audit_manifest.tla module which models the
         # manifest signature path (Option β) independently of audit.tla.
         # See formal/COMPOSITION.md and formal/audit_manifest.tla.
+        env:
+          CFG: ${{ matrix.cfg }}
         run: |
           JAVA_OPTS="-Xmx8g -XX:+UseParallelGC"
-          case "${{ matrix.cfg }}" in
+          case "$CFG" in
             audit_manifest_*) TLA_MODULE=audit_manifest.tla ;;
             *)                TLA_MODULE=audit.tla ;;
           esac
-          java $JAVA_OPTS -jar tla2tools.jar -config ${{ matrix.cfg }}.cfg -workers auto "$TLA_MODULE"
+          java $JAVA_OPTS -jar tla2tools.jar -config "$CFG.cfg" -workers auto "$TLA_MODULE"
         working-directory: formal
+
+  # One context standing for the whole audit-tlc matrix.
+  #
+  # The ruleset used to require each `audit-tlc (<cfg>)` by name, which
+  # makes the required set a hand-kept copy of a matrix that grows: two
+  # PRs added configs and neither updated the ruleset, so six of the
+  # seventeen ran without being required and could fail while the PR
+  # stayed mergeable — among them the sufficiency, model-only and
+  # manifest-signature slices. Requiring this one job instead means the
+  # matrix can gain a config without anyone remembering a second place.
+  #
+  # `needs` on a matrix job yields one result for the whole matrix:
+  # success only if every instance succeeded. `always()` so a cancelled
+  # or skipped matrix is reported rather than silently satisfying the
+  # gate by not running.
+  audit-tlc-all:
+    name: audit-tlc-all
+    runs-on: ubuntu-latest
+    needs: [detect-changes, audit-tlc]
+    if: ${{ always() }}
+    permissions:
+      contents: read
+    steps:
+      - name: Every audit-tlc config succeeded
+        env:
+          RESULT: ${{ needs.audit-tlc.result }}
+          GUARD: ${{ needs.detect-changes.result }}
+          DOCS_ONLY: ${{ needs.detect-changes.outputs.docs_only }}
+        run: |
+          if [ "$RESULT" = "success" ]; then
+            echo "audit-tlc: every config succeeded"
+            exit 0
+          fi
+          # A skip counts only where the guard ANSWERED and said the diff
+          # is prose. A skip for any other reason -- a cancelled matrix, a
+          # guard that could not answer -- is not an argument that the
+          # specs still hold.
+          if [ "$RESULT" = "skipped" ] && [ "$GUARD" = "success" ] && [ "$DOCS_ONLY" = "true" ]; then
+            echo "audit-tlc: skipped, prose-only diff"
+            exit 0
+          fi
+          echo "::error::audit-tlc matrix result is '$RESULT' (guard=$GUARD docs_only=$DOCS_ONLY)"
+          exit 1
 
   test-spec-invariants:
     # Dedicated job for the audit-spec BFS implementation check
@@ -339,12 +448,12 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
 
@@ -352,15 +461,13 @@ jobs:
         run: pip install --require-hashes -r requirements.lock
 
       - name: Install package and dev extras
-        run: pip install --no-deps -e . && pip install pytest pytest-mock respx pytest-xdist
+        run: pip install --no-deps -e . && pip install --require-hashes -r requirements-dev.lock
 
       - name: Run audit-spec BFS implementation check
-        # Parallelize across all available CPU cores via pytest-xdist.
-        # Parametrized rows are pure functions of (pkg, pins) — no
-        # shared state between rows, so xdist-safe by construction.
-        # Real Fulcio bundle minting is per-worker (each xdist worker
-        # is a distinct process and re-mints its bundle set on first
-        # use); the 4 worker × ~8 predicate-combo mint cost is well
-        # under one minute, and the ~7,200-row BFS work is the
-        # dominant cost — net 3-4x speedup on a 4-core runner.
-        run: python -m pytest -v -n auto tests/test_spec_invariants.py
+        # The (Package, Pins) space is swept once per process, in a
+        # module-scoped fixture, and every invariant is one test over
+        # the collected rows. One process: under xdist each worker
+        # would sweep the whole space (and mint its own bundle set)
+        # for the few tests it is handed, so parallelism would only
+        # multiply the work.
+        run: python -m pytest -v tests/test_spec_invariants.py

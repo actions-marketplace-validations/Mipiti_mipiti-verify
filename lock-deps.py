@@ -41,7 +41,18 @@ def strip_self_reference(path: Path) -> None:
 def main() -> None:
     # Target 3.12 (our minimum CI/Docker version) so transitive deps
     # like typing_extensions are included even when running on 3.13+.
-    common = ["--generate-hashes", "--strip-extras", "--python-version=3.12"]
+    #
+    # --universal resolves for every platform at once, so one lockfile is
+    # valid on Linux (CI / the action image) AND on a contributor's macOS or
+    # Windows machine. Without it the resolve takes the platform it runs on
+    # and DROPS the marked entries for the others (colorama / pywin32 on
+    # win32, jeepney / secretstorage on linux) — the committed lockfiles
+    # carry those markers, so a regeneration on the wrong machine silently
+    # removes dependencies CI needs.
+    common = [
+        "--universal", "--generate-hashes", "--strip-extras",
+        "--python-version=3.12",
+    ]
 
     print("Compiling requirements.lock ...")
     run([*common, "-o", "requirements.lock", "pyproject.toml"])
@@ -50,7 +61,20 @@ def main() -> None:
     run([*common, "--extra=all", "-o", "requirements-all.lock", "pyproject.toml"])
     strip_self_reference(ROOT / "requirements-all.lock")
 
-    print("Done. Review and commit requirements.lock and requirements-all.lock.")
+    # CI test tooling: the [dev] extra plus requirements-dev.in (tools
+    # that are CI-only and not part of the package's extras), constrained
+    # to requirements.lock so every package the two lockfiles share is
+    # pinned to the same version and CI can install both in sequence.
+    print("Compiling requirements-dev.lock ...")
+    run([
+        *common, "--extra=dev", "-c", "requirements.lock",
+        "-o", "requirements-dev.lock", "pyproject.toml", "requirements-dev.in",
+    ])
+
+    print(
+        "Done. Review and commit requirements.lock, requirements-all.lock "
+        "and requirements-dev.lock."
+    )
 
 
 if __name__ == "__main__":

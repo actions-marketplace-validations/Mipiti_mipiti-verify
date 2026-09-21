@@ -15,6 +15,12 @@ from mipiti_verify.definition_extract import extract_definition
 from mipiti_verify.runner import Runner
 
 
+
+def _excerpt(source_code: str) -> str:
+    """The excerpt handed to the judge, without the mechanical tier's facts
+    block the runner appends after it."""
+    return source_code.split("\n\n--- Facts (established by the mechanical tier) ---")[0]
+
 class _CapturingProvider:
     def __init__(self):
         self.source_code = None
@@ -31,7 +37,8 @@ class _CapturingProvider:
 
 def _verify(tmp_path, provider, a_type, name, filename="svc.py"):
     runner = Runner(client=MagicMock(), project_root=str(tmp_path),
-                    tier2_provider="anthropic", repo="acme/widgets")
+                    tier2_provider="anthropic", repo="acme/widgets",
+                    tier2_consistency_n=1)
     with patch("mipiti_verify.tier2.get_provider", return_value=provider):
         return runner._verify_tier2({
             "id": "asrt_x", "type": a_type,
@@ -211,7 +218,7 @@ class TestRunnerHandsReviewerTheDefinition:
         (tmp_path / "svc.py").write_text(src, encoding="utf-8")
         p = _CapturingProvider()
         _verify(tmp_path, p, "function_exists", "target")
-        assert p.source_code == "def target():\n    return check()"
+        assert _excerpt(p.source_code) == "def target():\n    return check()"
 
     def test_falls_back_to_file_when_block_cannot_be_isolated(self, tmp_path):
         # A prototype declares the symbol without opening a body, so there
@@ -222,17 +229,18 @@ class TestRunnerHandsReviewerTheDefinition:
         p = _CapturingProvider()
         _verify(tmp_path, p, "function_exists", "target", filename="svc.c")
         assert p.calls == 1
-        assert p.source_code == src
+        assert _excerpt(p.source_code) == src
 
     def test_other_types_unaffected(self, tmp_path):
         (tmp_path / "svc.py").write_text(PY_SRC, encoding="utf-8")
         p = _CapturingProvider()
         runner = Runner(client=MagicMock(), project_root=str(tmp_path),
-                        tier2_provider="anthropic", repo="acme/widgets")
+                        tier2_provider="anthropic", repo="acme/widgets",
+                        tier2_consistency_n=1)
         with patch("mipiti_verify.tier2.get_provider", return_value=p):
             runner._verify_tier2({
                 "id": "asrt_y", "type": "pattern_matches",
                 "params": {"file": "svc.py", "pattern": "return b"},
                 "repo": "acme/widgets",
             })
-        assert p.source_code == PY_SRC
+        assert _excerpt(p.source_code) == PY_SRC
