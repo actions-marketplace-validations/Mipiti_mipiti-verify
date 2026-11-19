@@ -96,12 +96,26 @@ jobs:
 
           # On the push trigger, the release commit is the squash-merge of
           # the release pipeline's version-bump PR: a tree that differs
-          # from its parent only in pyproject.toml, and within that file
-          # only in the version line. Assert exactly that shape.
+          # from its parent in pyproject.toml, only in the version line,
+          # and in CHANGELOG.md, only by the version's section, added as
+          # one block that opens with its heading. Assert exactly that
+          # shape.
           if [ "$EVENT_NAME" = "push" ]; then
-            CHANGED=$(git diff --name-only HEAD~1 HEAD)
-            if [ "$CHANGED" != "pyproject.toml" ]; then
-              echo "::error::Release commit must change only pyproject.toml; it changes: ${CHANGED:-nothing}"
+            CHANGED=$(git diff --name-only HEAD~1 HEAD | tr '\n' ' ')
+            if [ "$CHANGED" != "CHANGELOG.md pyproject.toml " ]; then
+              echo "::error::Release commit must change only CHANGELOG.md and pyproject.toml; it changes: ${CHANGED:-nothing}"
+              exit 1
+            fi
+            SECTION=$(git diff --unified=0 HEAD~1 HEAD -- CHANGELOG.md | awk '/^(@@|[+-])/ && !/^(\+\+\+|---) /')
+            # The first added line that is not blank: a diff may place the
+            # block's surrounding blank line on either side of it.
+            FIRST_ADDED=$(printf '%s\n' "$SECTION" | grep -m1 '^+.' || true)
+            VERSION_RE=$(printf '%s' "$PYPROJECT_VERSION" | sed 's/\./\\./g')
+            if [ "$(printf '%s\n' "$SECTION" | grep -c '^@@')" -ne 1 ] \
+               || printf '%s\n' "$SECTION" | grep -q '^-' \
+               || ! printf '%s\n' "$FIRST_ADDED" | grep -qxE "\+## \[${VERSION_RE}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}"; then
+              echo "::error::Release commit must add only the CHANGELOG.md section for $PYPROJECT_VERSION, as one block opening with its heading"
+              printf '%s\n' "$SECTION" | head -5
               exit 1
             fi
             # Every changed line must be a version line, with the new one
@@ -124,7 +138,7 @@ jobs:
       # --- PyPI publish ---
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
@@ -146,12 +160,12 @@ jobs:
         # v1.14.2 bundles twine>=7, which accepts Metadata-Version 2.5 (v1.13.0
         # bundled twine 6.2.0, whose hardcoded valid-version list caps at 2.4 —
         # its internal verify-metadata + upload reject a 2.5 wheel).
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
 
       # --- Docker image publish ---
 
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -187,7 +201,7 @@ jobs:
       # `image: docker://...@sha256:...` reference.
 
       - name: Generate dispatch token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510  # v3.3.0
         id: app-token
         with:
           client-id: ${{ secrets.DISPATCH_CLIENT_ID }}

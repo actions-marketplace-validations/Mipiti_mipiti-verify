@@ -2977,6 +2977,144 @@ def _render_findings(pkg: dict) -> bool:
     return False
 
 
+_RECHECK_MARKUP = {
+    "rechecked": "[green]RE-CHECKED[/green]",
+    "failed": "[red]FAILED[/red]",
+    "not_rechecked": "[yellow]NOT RE-CHECKED[/yellow]",
+    "missing": "[yellow]MISSING[/yellow]",
+}
+
+_SOURCE_LABEL = {
+    "judge": "judge",
+    "static": "analysis",
+    "model_check": "model check",
+    "design": "design",
+    "": "none",
+}
+
+
+def _render_behavioural(report, pkg: dict) -> None:
+    """Render what each group decision rests on (``objective_judgements``):
+    its source and how it reads, and for an analysis decision each
+    certificate and proof with its re-check. The full listing; the summary
+    output prints counts (``_behavioural_summary_lines``)."""
+    from .behavioural import readings
+
+    console.print("\n[bold]Group decisions (what each rests on)[/bold]")
+    legend = readings(pkg)
+    for d in report.decisions:
+        source = _SOURCE_LABEL.get(d.source, d.source)
+        disp = f" {d.disposition}" if d.disposition else ""
+        console.print(f"  [bold]{d.co_id}[/bold] {d.subject}: {source}{disp}  "
+                      f"[dim]{d.reading or 'no reading'}[/dim]")
+        meaning = legend.get(d.reading, "")
+        if meaning and d.source != "judge":
+            console.print(f"      [dim]{meaning}[/dim]")
+        if d.runs_limit:
+            console.print(f"      [yellow]{d.runs_limit}[/yellow]")
+        for r in d.rechecks:
+            detail = f" — {r.detail}" if r.detail else ""
+            console.print(f"      {r.kind} of {r.obligation_id or '?'}: "
+                          f"{_RECHECK_MARKUP.get(r.status, r.status)}{detail}")
+    for tool, why in sorted(report.tools_missing.items()):
+        console.print(f"  [yellow]Not re-checked here: {why}[/yellow]")
+
+
+def _render_strength(report) -> None:
+    """Render each control's evidence strength (``clause_strength``), each
+    clause recomputed from its edges, and every clause whose evidence no
+    longer passes; a strength its own record does not give is marked."""
+    console.print("\n[bold]Evidence strength (recomputed from each clause's evidence)[/bold]")
+    for c in report.controls:
+        mark = "[green]✓[/green]" if c.consistent else "[red]✗ not what its evidence gives[/red]"
+        basis = "" if c.basis == "now" else " [dim](as judged)[/dim]"
+        console.print(f"  [bold]{c.control_id}[/bold]: {c.served or 'unrecorded'}{basis} {mark}")
+        for cl in c.clauses:
+            notes = []
+            if not cl.consistent:
+                notes.append(f"[red]stated {cl.served}, its evidence gives {cl.recomputed}[/red]")
+            if cl.no_longer_passing:
+                notes.append(f"[yellow]no longer passing: {', '.join(cl.no_longer_passing)}[/yellow]")
+            if notes:
+                console.print(f"      {cl.clause}: {cl.recomputed} — " + "; ".join(notes))
+
+
+def _strength_summary_lines(report) -> list[str]:
+    """The summary output's account of evidence strength: how many controls'
+    stated strength their evidence gives, and each that it does not."""
+    bad = report.inconsistent
+    lines = [f"  {len(report.controls) - len(bad)}/{len(report.controls)} control(s) "
+             "state the strength their evidence gives"]
+    for c in bad:
+        lines.append(f"    [red]✗ {c.control_id}: stated {c.served or 'unrecorded'}, "
+                     f"its evidence gives {c.recomputed or 'none'}[/red]")
+    return lines
+
+
+def _render_commitments(report) -> None:
+    """Render what each declared control was checked against
+    (``declared_commitments``): its declaration's clauses, who declared it,
+    and the cross-check with each finding and whether a person dismissed it;
+    every way the record disagrees with itself or its served status is marked."""
+    console.print("\n[bold]Declared controls (what each was checked against)[/bold]")
+    for c in report.controls:
+        mark = "[green]✓[/green]" if c.consistent else "[red]✗[/red]"
+        who = f" declared by {c.declared_by}" if c.declared_by else ""
+        when = f" at {c.declared_at}" if c.declared_at else ""
+        console.print(f"  [bold]{c.control_id}[/bold]: {c.served or 'unrecorded'}{who}{when} "
+                      f"{mark}")
+        for text in c.clauses:
+            console.print(f"      • {text}")
+        if not c.cross_check_completed:
+            console.print("      [yellow]cross-check not completed[/yellow]")
+        for f in c.findings:
+            state = "[dim]dismissed[/dim]" if f.get("dismissed") else "[yellow]open[/yellow]"
+            console.print(f"      cross-check finding ({state}): {f.get('text') or ''}")
+        for problem in c.problems:
+            console.print(f"      [red]{problem}[/red]")
+
+
+def _commitments_summary_lines(report) -> list[str]:
+    """The summary output's account of declared controls: how many, how many
+    cross-check findings stand open, and each record that disagrees."""
+    open_ = sum(len(c.open_findings) for c in report.controls)
+    lines = [f"  {len(report.controls)} declared control(s); "
+             + (f"[yellow]{open_} open cross-check finding(s)[/yellow]" if open_
+                else "no open cross-check finding")]
+    for c in report.inconsistent:
+        for problem in c.problems:
+            lines.append(f"    [red]✗ {c.control_id}: {problem}[/red]")
+    return lines
+
+
+def _behavioural_summary_lines(report) -> list[str]:
+    """The summary output's account of the group decisions: how many each
+    source decided, and how their certificates and proofs fared."""
+    by_source: dict = {}
+    for d in report.decisions:
+        label = _SOURCE_LABEL.get(d.source, d.source)
+        by_source[label] = by_source.get(label, 0) + 1
+    lines = ["  Decisions: " + ", ".join(f"{n} by {s}" for s, n in sorted(by_source.items()))]
+    for kind in ("certificate", "proof"):
+        total = sum(1 for r in report.rechecks() if r.kind == kind)
+        if not total:
+            continue
+        parts = [f"{report.count('rechecked', kind)} re-checked"]
+        for status, word in (("failed", "failed"), ("not_rechecked", "not re-checked"),
+                             ("missing", "missing")):
+            n = report.count(status, kind)
+            if n:
+                colour = "red" if status == "failed" else "yellow"
+                parts.append(f"[{colour}]{n} {word}[/{colour}]")
+        lines.append(f"  {kind.capitalize()}s: {total} — " + ", ".join(parts))
+    for d in report.decisions:
+        for r in d.rechecks:
+            if r.status == "failed":
+                lines.append(f"    [red]✗ {d.co_id} {d.subject}: {r.kind} of "
+                             f"{r.obligation_id or '?'} — {r.detail}[/red]")
+    return lines
+
+
 # Known top-level audit-pack sections a signed manifest may cover, for
 # documentation and test fixtures. Verification does NOT depend on
 # this list: section hashes are, by contract, SHA-256 over the
@@ -3000,6 +3138,8 @@ _MANIFEST_SECTIONS: tuple[str, ...] = (
     "assertions_by_functional_test",
     "contributing_runs",
     "provenance_health",
+    "clause_strength",
+    "declared_commitments",
 )
 
 
@@ -4232,6 +4372,52 @@ def _verify_contributing_runs(
     ),
 )
 @click.option(
+    "--no-recheck",
+    "no_recheck",
+    is_flag=True,
+    default=False,
+    help=(
+        "Do not run Apalache or tlapm on the certificates and proofs an "
+        "analysis decision carries. Each is still checked to be bound to "
+        "its own texts; it is reported NOT RE-CHECKED."
+    ),
+)
+@click.option(
+    "--require-recheck",
+    "require_recheck",
+    is_flag=True,
+    default=False,
+    help=(
+        "Fail the audit when a decision that credits with no judge (an "
+        "analysis decision that covers its objective, or an objective "
+        "satisfied by design) rests on a certificate or proof this run did "
+        "not re-check, or one the package does not carry. Without it such "
+        "a decision is listed as a caveat. Re-checking needs the pinned "
+        "Apalache (APALACHE_JAR, or apalache-mc on PATH, and java) and "
+        "tlapm (TLAPM, or tlapm on PATH)."
+    ),
+)
+@click.option(
+    "--recheck-timeout",
+    "recheck_timeout",
+    default=600,
+    type=int,
+    show_default=True,
+    help="Seconds allowed for each Apalache check and each tlapm run.",
+)
+@click.option(
+    "--tools",
+    "tools_mode",
+    type=click.Choice(["local", "image", "auto"]),
+    default="local",
+    show_default=True,
+    help=(
+        "Where the checkers run: the pinned Apalache and tlapm installed "
+        "here (local), the pinned tools image through Docker (image), or "
+        "the installed tools where both are and the image otherwise (auto)."
+    ),
+)
+@click.option(
     "--full",
     "full_output",
     is_flag=True,
@@ -4267,6 +4453,10 @@ def audit(
     rekor_entry_snapshot_dir: str | None,
     require_verification: bool,
     allow_orphan_results: bool,
+    no_recheck: bool,
+    require_recheck: bool,
+    recheck_timeout: int,
+    tools_mode: str,
     full_output: bool,
 ) -> None:
     """Verify an audit package, signed HTML report, or signed PDF report.
@@ -4319,6 +4509,20 @@ def audit(
     verification chain is offline-replayable indefinitely with no
     live Mipiti or Rekor access required. Mutually exclusive with
     --rekor-anchor (URL-based one-shot vs directory-based search).
+
+    Group decisions: a package that states how each mitigation group was
+    decided lists each decision's source (a judge, the behavioural
+    analysis, a model check) and re-checks what an analysis decision rests
+    on: each certificate with Apalache, each proof with tlapm, from the
+    texts the package carries. A certificate or proof that does not hold
+    up fails the audit; one that could not be re-checked here is a caveat,
+    or a failure under --require-recheck.
+
+    Evidence strength and declared controls: each clause's stated strength
+    is recomputed from the evidence the package carries for it, and each
+    declared control's record (its declaration and the cross-check's
+    findings) is re-checked against itself and the status its control was
+    served. A record that disagrees fails the audit.
     """
     render = _AuditRender(full=full_output)
     try:
@@ -4342,6 +4546,10 @@ def audit(
             rekor_entry_snapshot_dir=rekor_entry_snapshot_dir,
             require_verification=require_verification,
             allow_orphan_results=allow_orphan_results,
+            recheck=not no_recheck,
+            require_recheck=require_recheck,
+            recheck_timeout=recheck_timeout,
+            tools_mode=tools_mode,
             render=render,
         )
     finally:
@@ -4374,6 +4582,10 @@ def _audit_impl(
     require_verification: bool,
     allow_orphan_results: bool,
     render: _AuditRender,
+    recheck: bool = True,
+    require_recheck: bool = False,
+    recheck_timeout: int = 600,
+    tools_mode: str = "local",
 ) -> None:
     """Audit-command implementation. See ``audit`` for the contract;
     ``render`` selects between the summary and full output modes."""
@@ -6122,6 +6334,59 @@ def _audit_impl(
     # older packs (renders nothing). Informational — never fails the audit.
     _render_findings(pkg)
 
+    # --- Group decisions (behavioural model) ---
+    # Additive signed section: how each mitigation group was decided, and
+    # for an analysis decision the certificates and proofs it rests on,
+    # re-checked here from the texts the package carries. Absent on packages
+    # without a behavioural model. A certificate or proof that does not hold
+    # up fails the audit; one not re-checked here fails it only under
+    # --require-recheck (else it is a caveat).
+    behavioural_report = None
+    if isinstance(pkg.get("objective_judgements"), dict):
+        from .behavioural import check as _behavioural_check
+        from .design_bundle import pinned_image as _pinned_image
+
+        behavioural_report = _behavioural_check(
+            pkg, run_tools=recheck, timeout=float(recheck_timeout),
+            tools_mode=tools_mode, image=_pinned_image())
+        _render_behavioural(behavioural_report, pkg)
+        if behavioural_report.failed:
+            has_failure = True
+        if require_recheck and behavioural_report.unsettled():
+            console.print(
+                f"  [red]{len(behavioural_report.unsettled())} certificate(s) or "
+                "proof(s) a decision credits on were not re-checked here, and "
+                "--require-recheck is set.[/red]")
+            has_failure = True
+
+    # --- Evidence strength (clause_strength) ---
+    # Additive signed section: each clause's strength beside its sufficiency,
+    # with the edges it was composed over. Recomputed here from the edges; a
+    # strength the package's own record does not give fails the audit.
+    strength_report = None
+    if isinstance(pkg.get("clause_strength"), dict):
+        from .strength import check as _strength_check
+
+        strength_report = _strength_check(pkg)
+        _render_strength(strength_report)
+        if strength_report.inconsistent:
+            has_failure = True
+
+    # --- Declared controls (declared_commitments) ---
+    # Additive signed section: what each declared control was checked
+    # against, its declaration and the cross-check's findings. Each clause's
+    # and finding's id is recomputed from its words; a record that disagrees
+    # with itself, or a control served sufficient with its cross-check
+    # missing or a finding no person dismissed, fails the audit.
+    commitments_report = None
+    if isinstance(pkg.get("declared_commitments"), dict):
+        from .commitments import check as _commitments_check
+
+        commitments_report = _commitments_check(pkg)
+        _render_commitments(commitments_report)
+        if commitments_report.inconsistent:
+            has_failure = True
+
     # --- Run-level provenance (contributing runs) ---
     # Additive envelope keys: `contributing_runs` (one entry per
     # status-determining run, each independently verifiable) and
@@ -6353,6 +6618,18 @@ def _audit_impl(
                 "(report predates run-level provenance disclosure; "
                 "latest-run evidence only)"
             )
+        if behavioural_report is not None and behavioural_report.rechecks():
+            _all = len(behavioural_report.rechecks())
+            _done = behavioural_report.count("rechecked")
+            if behavioural_report.failed:
+                state = "[red]FAILED[/red]"
+            elif _done == _all:
+                state = "[green]RE-CHECKED[/green]"
+            else:
+                state = "[yellow]PARTIAL[/yellow]"
+            console.print(
+                f"  Certificates & proofs:  {state} ({_done}/{_all} re-checked here)"
+            )
         # Auditor pin enforcement.
         pin_lines = [
             ("Identity (SAN/issuer):  ", expected_ci_identity, "--expected-ci-identity"),
@@ -6546,6 +6823,24 @@ def _audit_impl(
                 if row["status"] == _RUN_STATUS_VERIFIED:
                     for message, hint, _style in row["notes"]:
                         render.caveat(message, hint)
+        if behavioural_report is not None:
+            for tool, why in sorted(behavioural_report.tools_missing.items()):
+                render.caveat(f"Certificates and proofs not re-checked here: {why}.")
+            unsettled = behavioural_report.unsettled()
+            if unsettled:
+                missing = sum(1 for r in unsettled if r.status == "missing")
+                render.caveat(
+                    f"{len(unsettled)} certificate(s) or proof(s) a decision "
+                    f"credits on were not re-checked here"
+                    + (f" ({missing} not carried by the package)" if missing else "")
+                    + ".",
+                    "Re-run with the pinned Apalache and tlapm installed; pass "
+                    "--require-recheck to make this a failure.",
+                )
+            for d in behavioural_report.decisions:
+                if d.runs_limit and d.credits_alone:
+                    render.caveat(f"{d.co_id} {d.subject}: {d.runs_limit}")
+                    break
         if isinstance(comp_raw, dict):
             if comp_raw.get("available") is False:
                 err = comp_raw.get("error", "composition_compute_failed")
@@ -6741,6 +7036,18 @@ def _audit_impl(
         _print_disclosure_crosscheck()
         _print_caveats()
         _print_results_summary()
+        if behavioural_report is not None:
+            console.print("\n[bold]Group decisions[/bold]")
+            for line in _behavioural_summary_lines(behavioural_report):
+                console.print(line)
+        if strength_report is not None and strength_report.controls:
+            console.print("\n[bold]Evidence strength[/bold]")
+            for line in _strength_summary_lines(strength_report):
+                console.print(line)
+        if commitments_report is not None and commitments_report.controls:
+            console.print("\n[bold]Declared controls[/bold]")
+            for line in _commitments_summary_lines(commitments_report):
+                console.print(line)
         if isinstance(comp_raw, dict):
             _render_composition_summary(comp_raw)
         evidence_detail = render.take_saved()
@@ -6753,3 +7060,128 @@ def _audit_impl(
     console.print()
 
     sys.exit(1 if (has_failure or total_fail > 0) else 0)
+
+
+@main.command(name="design-bundle")
+@click.argument("bundle_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--key-url", default="",
+              help="JWKS URL of the Mipiti instance that signed the bundle "
+                   "(default: https://api.mipiti.io/.well-known/jwks)")
+@click.option("--platform-pubkey", "platform_pubkey_path", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="PEM public key of the platform, held by the auditor, used "
+                   "instead of the JWKS.")
+@click.option("--recheck", is_flag=True, default=False,
+              help="Run Apalache on every certificate and tlapm on every proof.")
+@click.option("--tools", "tools_mode", type=click.Choice(["auto", "local", "image"]),
+              default="auto", show_default=True,
+              help="Where the checkers run: the pinned tools installed here "
+                   "(local), the pinned tools image through Docker (image), or "
+                   "the installed tools where both are and the image otherwise.")
+@click.option("--image", "image", default="",
+              help="A tools image you built yourself from mipiti-verify's "
+                   "design-check/ directory, by tag or digest, instead of the "
+                   "image this release pins. It must hold the pinned tool "
+                   "releases.")
+@click.option("--jobs", default=1, type=click.IntRange(1, 64), show_default=True,
+              help="Certificates and proofs re-checked at once.")
+@click.option("--sample", default=0, type=click.IntRange(0), show_default=True,
+              help="Re-check only this many obligations, drawn with --seed "
+                   "(0: every one).")
+@click.option("--seed", default=None, type=int,
+              help="Seed of the sample, so another reader draws the same one.")
+@click.option("--timeout", "recheck_timeout", default=600, type=int, show_default=True,
+              help="Seconds allowed for each Apalache check and each tlapm run.")
+def design_bundle(bundle_file: str, key_url: str, platform_pubkey_path: str | None,
+                  recheck: bool, tools_mode: str, image: str, jobs: int, sample: int,
+                  seed: int | None, recheck_timeout: int) -> None:
+    """Verify a design proof bundle, and re-check its certificates and proofs.
+
+    Checks the platform's signature over the manifest, every file against
+    the manifest's hash, the coverage it states against the obligations
+    it lists, and that every obligation decided by a certificate or proof
+    has it, of that obligation and its kind. Each certificate and proof is
+    checked to be about its own module and claim: the invariant's module
+    extends only the certificate's module, states the module's claim, binds
+    the constants and nothing else; a proof assumes nothing of its own,
+    omits no step, and proves the claim of every behaviour of the module.
+
+    With --recheck, Apalache's three checks run on every certificate (and
+    two witnesses that they are not vacuous), and tlapm on every proof,
+    with the commands the platform runs, built here: nothing in the bundle
+    is executed. --sample K --seed S re-checks K obligations drawn with S.
+
+    Exit 0 when everything holds (and, with --recheck, every certificate
+    and proof selected was re-checked here); 1 otherwise.
+    """
+    from . import behavioural as B
+    from . import design_bundle as DB
+
+    try:
+        with open(bundle_file, "rb") as fh:
+            bundle = DB.read(fh.read())
+        fp = DB.embedded_fingerprint(bundle)
+    except DB.BundleError as e:
+        console.print(f"[red]Not a design proof bundle: {e}[/red]")
+        sys.exit(1)
+
+    trusted = None
+    if platform_pubkey_path:
+        from cryptography.hazmat.primitives import serialization
+
+        with open(platform_pubkey_path, "rb") as fh:
+            trusted = serialization.load_pem_public_key(fh.read())
+        console.print(f"  Platform key:    {platform_pubkey_path}")
+    elif fp:
+        trusted, _, used = _resolve_pubkey_from_jwks(fp, key_url)
+        console.print(f"  Platform key:    {fp[:16]}... from {used}")
+
+    tools = None
+    if recheck:
+        tools, missing = B.resolve_tools(tools_mode, image or DB.pinned_image())
+        for why in missing.values():
+            console.print(f"  [yellow]{why}[/yellow]")
+
+    result = DB.check(bundle, trusted, recheck=recheck, tools=tools,
+                      timeout=float(recheck_timeout), jobs=jobs, sample=sample, seed=seed)
+    m = result.manifest
+    console.print(f"\n[bold]Design proof bundle[/bold] {m.get('title', '')!s} "
+                  f"(model {m.get('model_id', '?')} v{m.get('model_version', '?')}, "
+                  f"{m.get('status', '?')})")
+    if result.key_fingerprint:
+        console.print(f"  Signed by:       {result.key_fingerprint[:16]}...")
+    cov = result.coverage
+    if cov:
+        console.print(f"  Obligations:     {cov['obligations']}: {cov['proved']} proved, "
+                      f"{cov['certified']} certified, {cov['to_judge']} to the judge, "
+                      f"{cov['not_evaluated']} not evaluated")
+    for problem in result.problems:
+        console.print(f"  [red]✗ {problem}[/red]")
+    for kind in ("certificate", "proof"):
+        total = sum(1 for r in result.rechecks if r.kind == kind)
+        if not total:
+            continue
+        failed = result.count(B.FAILED, kind)
+        if recheck:
+            parts = [f"{result.count(B.RECHECKED, kind)} re-checked"]
+            if result.count(B.NOT_RECHECKED, kind):
+                parts.append(f"{result.count(B.NOT_RECHECKED, kind)} not re-checked")
+        else:
+            parts = [f"{total - failed} about their module and claim"]
+        if failed:
+            parts.append(f"{failed} failed")
+        console.print(f"  {kind.capitalize() + 's:':<17}{total}: " + ", ".join(parts))
+    for r in result.rechecks:
+        if r.status != B.RECHECKED and (recheck or r.status == B.FAILED):
+            colour = "red" if r.status == B.FAILED else "yellow"
+            console.print(f"    [{colour}]{r.kind} of {r.obligation_id}: {r.status}"
+                          f"{' — ' + r.detail if r.detail else ''}[/{colour}]")
+    if result.not_sampled:
+        console.print(f"  Sample:          {sample} obligation(s) drawn with seed {seed}; "
+                      f"{result.not_sampled} not re-checked in this run")
+    if not recheck and not result.failed:
+        console.print("  [dim]Certificates and proofs checked, not re-run: pass --recheck "
+                      "to run Apalache and tlapm on them.[/dim]")
+    ok = not result.failed and not (recheck and result.unsettled())
+    console.print(f"\n  Verdict:         {'[green]VERIFIED[/green]' if ok else '[red]FAILED[/red]'}")
+    sys.exit(0 if ok else 1)

@@ -79,6 +79,29 @@ Independently verifies ECDSA document signatures on exported HTML reports and JS
 
 **Bundle binding.** When an audit package carries a Sigstore bundle, the envelope must also carry `content_integrity.bundle_bind_hash` — the explicit hash the verifier compares against the bundle's in-toto Subject digest (no canonicalisation, no rehashing). Older envelopes that omit this field are rejected. Re-export the audit package from a current Mipiti build to obtain the bundle-bind coverage.
 
+### `design-bundle` — Verify a design proof bundle, and re-check its proofs
+
+```bash
+mipiti-verify design-bundle design-proof-bundle-<model>-v<n>.tar.gz
+mipiti-verify design-bundle design-proof-bundle-<model>-v<n>.tar.gz --recheck
+mipiti-verify design-bundle design-proof-bundle-<model>-v<n>.tar.gz --recheck --sample 20 --seed 7 --jobs 4
+```
+
+A design proof bundle is the archive a model's behavioural model is downloaded as: every obligation with what decides it (a certificate, a proof, or the judge), the certificates and proofs themselves, and a manifest signed by the platform over every file's hash. Without `--recheck` the command checks, with no tools:
+
+- the platform's signature over the manifest, by the key the platform's JWKS publishes under the bundle's fingerprint (`--key-url` for another instance; `--platform-pubkey <pem>` for a key you hold);
+- every file against the manifest's hash, and no file the manifest does not name; the archive is read without extracting it, regular files under `design-proof-bundle/` only;
+- the coverage the manifest states, counted again from the obligations it lists; that every obligation decided by a certificate or proof has it, of that obligation and its kind; and that an objective stated satisfied by design rests only on such obligations;
+- that each certificate is about its module and its claim: the invariant's module extends only the certificate's module and Apalache, its `Prop` is the module's own claim, it binds the module's constants to values and nothing else, and the states its step and property checks start from are the invariant's own; and that each proof assumes and omits nothing, proves the certificate's invariant, and proves the claim of every behaviour of the module.
+
+`--recheck` then runs Apalache's three checks on every certificate (the invariant holds initially, every step keeps it, it implies the property), with two witnesses that they are not vacuous (a state of the module's initial predicate exists, and a state the step and property checks start from exists), and `tlapm` on every proof, every obligation of which must close. The commands are the ones the platform ran, built by the verifier; nothing in the bundle is executed, `recheck.sh` included. `--sample K --seed S` re-checks K obligations drawn by a seed you choose, so another reader can draw the same ones; `--jobs N` runs N at once.
+
+The checkers run in the tools image this release pins (`--tools image`), with the network off, as an unprivileged user, on a copy of the files: Apalache 0.62.4 on Java 21, `tlapm` 3edc73c with Z3 5.3.0. The image is built in this repository from [`design-check/Dockerfile`](design-check/Dockerfile), from public sources pinned by commit or digest, and published as `ghcr.io/mipiti/mipiti-design-check` with a build provenance attestation (`gh attestation verify oci://ghcr.io/mipiti/mipiti-design-check@<digest> --repo Mipiti/mipiti-verify`). To use an image you built yourself from that file, pass `--image <tag>`; to use tools installed on your machine, `--tools local` (`APALACHE_JAR` or `apalache-mc` on PATH with Java 21, `TLAPM` or `tlapm` on PATH with Z3 on PATH). Either way the verifier checks each tool is the pinned release before it runs. The default, `--tools auto`, uses installed tools where both are present and the image otherwise.
+
+What a verified bundle shows, and what it does not: each certificate shows its invariant holds for the module within the scope recorded in the module's constants, and each proof shows it at every scope. The module is the platform's compilation of the behavioural model as confirmed, and the bounds of the symbolic state a step check starts from are the platform's choice. An availability claim, which is about eventually answering, is certified through `Answerable`, a property of states the platform has shown once implies it. The bundle states neither that the system is secure nor that the behavioural model is the system.
+
+Exits 0 when everything holds (and, with `--recheck`, every certificate and proof selected was re-checked); 1 otherwise.
+
 ### `attest-tests` / `attest-dependence` / `attest-reach` — Record test evidence in the test job
 
 ```bash
@@ -132,7 +155,34 @@ Verification state in a report accumulates across (often partial) CI runs — ea
 
 The verifier checks each run independently: SHA-256 recomputed over the exact `results_canonical` bytes against `results_hash`, the signature over the hash with the run's key (embedded PEM or JWKS lookup by fingerprint), and the per-run Sigstore bundle when present. Each run is reported as `VERIFIED`, `UNRESOLVED KEY`, `UNVERIFIABLE SERIALIZATION`, `TAMPER-MISMATCH`, or `UNSIGNED`. A run whose `content_integrity` declares `unverifiable_serialization` (signed material exists but the signed bytes can no longer be re-derived; the serialization predates canonical freezing) is a coverage limitation — reported distinctly from a hash mismatch and never treated as tampering. A genuine mismatch over present `results_canonical` fails the audit.
 
+### Group decisions and what each rests on (`objective_judgements`)
+
+A package for a model with a behavioural model states, per control objective, how each mitigation group was decided: by a judge, by the behavioural analysis alone (`static`), or by a model check (`model_check`), each with a reading that words it as what it is (a possible threat found by analysis is never reported as a judged insufficiency). The verifier lists every decision with its source.
+
+An analysis decision that credits with no judge rests on certificates, and the package carries each one: the obligation's module text, the invariant Apalache checked, and the Apalache release. Where its proof closed it also carries the proof: the proof text, the module text, the `tlapm` build, and each step's time limit. An objective satisfied by design (every obligation holding with no control) carries its certificates the same way. The verifier:
+
+- checks that each certificate is bound to its own texts (the module text hashes to the module hash it names, the module it names is the module the text declares, the outcome is certified), and that each proof is of its certificate's module and invariant;
+- checks that each certificate and proof is about its module and its claim, as [`design-bundle`](#design-bundle--verify-a-design-proof-bundle-and-re-check-its-proofs) does;
+- re-runs Apalache's three checks on each certificate (the invariant holds initially, every step keeps it, it implies the property) and the two witnesses that they are not vacuous, from the texts in the package;
+- re-runs `tlapm` on each proof, with the platform's command, every obligation of which must close.
+
+Re-checking needs the pinned tools: Apalache 0.62.4 (`APALACHE_JAR`, or `apalache-mc` on PATH, with a Java 21 runtime) and `tlapm` 3edc73c with Z3 5.3.0 (`TLAPM`, or `tlapm` on PATH, and `z3` on PATH), or the pinned tools image through Docker (`--tools image`, or `--tools auto` to use it where the tools are not installed). A certificate or proof that does not hold up (a text that does not hash to what it names, an invariant or proof not about its module and claim, a proof of another invariant, a check Apalache refutes or that holds vacuously, a proof step that does not close) fails the audit. One that could not be re-checked here (no tool, another release, a checker error or time-out) is a caveat; `--require-recheck` makes it a failure for any decision that credits with no judge, and so does a certificate the package names but does not carry. `--no-recheck` skips the tools and keeps the binding checks. A model check's explored result is listed with what it rests on (the runner pool and the agreement of two runs): it is not a proof an auditor can check independently, and the verifier does not re-run it.
+
 Assertions carried by the report's records but determined by no embedded run are reported as **manifest-only provenance**, cross-checked against `provenance_health.assertions_manifest_only`. When contributing runs are embedded, the deprecated top-level `results_hash` + `signature` pair is superseded: a divergence there is rendered informationally (`NOT SCORED`) and tamper conclusions come solely from the per-run checks. Older envelopes without these keys verify exactly as before — the legacy pair stays strict, and the trust contract reports run-level provenance as `UNKNOWN` (latest-run evidence only), never as a failure.
+
+### Evidence strength (`clause_strength`)
+
+A package states, beside each control's sufficiency, how strongly each of its clauses is proven, on the order `none < claimed < witnessed < sound < constructed`, with the evidence each clause rests on and every fact the tier depends on: the evidence's soundness class, how it is bound to the clause, both verification tiers, whether its run was attested and its statement signed, whether its scope covers the path, and what an enumeration decided. A control is as strong as its weakest clause. The verifier recomputes every clause's tier and coverage from that evidence, and every control's from its clauses, with the platform's rules (held equal to them by a table of cases the platform decided), and fails a package whose stated strength its own record does not give. A strength stated as it was judged, for a superseded version, carries no evidence and is listed as such. Evidence that no longer passes is named beside its clause.
+
+### Declared controls (`declared_commitments`)
+
+A control a person declared a behavioural delta for is judged against that declaration rather than a decomposition of its text: one clause per edit, and one per thing the declaration says the text commits to that no edit states. Before such a control can read sufficient, its text is cross-checked once against the declaration for anything it commits to beyond it, and a person must dismiss every finding. The package states, per declared control, the declaration (its clauses, who declared it and when, the spans it says commit to nothing) and the cross-check with each finding and whether it was dismissed. The verifier:
+
+- recomputes each clause's id from its words and each finding's id from its words (held equal to the platform's by a table of cases the platform produced);
+- checks that a control served a verdict was declared over its text as the package states it;
+- checks that a control served sufficient has a completed cross-check, no finding left undismissed, and every span said to commit to nothing still reading in its text.
+
+A record that disagrees with itself, or with the status its control was served, fails the audit. An open finding on an insufficient control is why it reads insufficient, and is listed, not failed.
 
 ### Each check the verifier runs
 
@@ -181,6 +231,9 @@ The verifier exits non-zero on any of:
 - Bundle-bind signature present but no platform key resolvable (would be silent skip otherwise).
 - Document signature on the PDF/HTML body is missing or invalid.
 - Pinning flags supplied to a format that can't honour them (e.g. identity pins on an HTML report — fails-closed instead of silently dropping the pin).
+- A certificate or proof an analysis decision carries does not hold up: its texts do not hash to what it names, a proof is not of its certificate's invariant, Apalache refutes a check, or a proof step does not close. Under `--require-recheck`, also any certificate or proof a no-judge decision credits on that was not re-checked here or is not carried.
+- A clause or control's stated evidence strength is not what its own evidence gives.
+- A declared control's record disagrees with itself (a clause or finding whose id its words do not give, a declaration over another text than the one served a verdict), or its control is served sufficient with the cross-check missing, a finding no person dismissed, or a span said to commit to nothing that no longer reads.
 
 There is no `--allow-unsigned`, no soft-fail, and no fallback that treats a missing signature as "good." When the auditor needs to enforce attestation on the producer side too (CI runner), use `--require-attestation` on `mipiti-verify run` to make missing/failed signing a non-zero exit.
 
@@ -193,6 +246,7 @@ Every published audit can be re-checked offline using only:
 - The customer's workspace key fingerprint (auditor's out-of-band knowledge).
 - The customer's CI workflow identity (auditor's out-of-band knowledge).
 - For the customer-keyed offline DSSE path: the customer's public key, pinned out-of-band by the auditor via `--expected-customer-key`.
+- For the certificates and proofs of analysis decisions: Apalache 0.62.4 (on Java 21) and `tlapm` 3edc73c with Z3 5.3.0, installed or in the pinned tools image, run on the texts the package carries.
 
 No live Mipiti API access is required at audit time. The verifier produces the same verdict on the same input regardless of network reachability to api.mipiti.io.
 
@@ -265,7 +319,7 @@ jobs:
       # recorded as evidence; verification reads it and runs nothing itself.
       - run: pytest --junitxml=report.xml
 
-      - uses: Mipiti/mipiti-verify@a696d209d799dfca1d4f7efc6327962161dc26de # v0.55.6
+      - uses: Mipiti/mipiti-verify@0ae121914021edccb6b6f0f49dac0cd00757a1dd # v0.57.2
         with:
           # Required
           api-key: ${{ secrets.MIPITI_API_KEY }}

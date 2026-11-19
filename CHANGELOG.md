@@ -5,7 +5,50 @@ All notable changes to `mipiti-verify` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+Every merged change is released: a version's section is written by its
+release, from the changelog entry in the description of each pull request it
+ships.
+
+## [0.57.2] - 2026-10-31
+
+### Changed
+
+- Bump the github-actions group with 2 updates (#458)
+
+### Fixed
+
+- Dependencies: pyasn1 0.6.5, tuf 7.0.1, dnspython 2.9.1 (security advisories). (#459)
+
+## [0.57.1] - 2026-10-26
+
+### Fixed
+
+- Formal checker `check_audit_partition_total.py` no longer raises invalid escape sequence warnings. (#454)
+
+## [0.57.0] - 2026-10-24
+
+### Added
+
+- `design-bundle`: verify a design proof bundle's signature, files, coverage and decisions, and that each certificate and proof is about its own claim; `--recheck` re-runs every certificate and proof with the pinned Apalache and TLAPS, installed or in the published tools image, with `--sample`/`--seed` and `--jobs`. (#448)
+- `audit`: re-checks proofs with the full prover pin and the platform's tlapm command, applies the same structural checks to certificates and proofs, and takes `--tools`. (#448)
+- Dependencies: the `certifi` floor is raised to 2026.10.19, past PYSEC-2026-4320. (#448)
+
+### Changed
+
+- Bump pypa/gh-action-pypi-publish from 1.14.2 to 1.14.3 in the github-actions group (#449)
+- Publish the design check tools image only from main (#450)
+
+## [0.56.1] - 2026-10-18
+
+### Changed
+
+- Bump python from `2f17fc0` to `a6e34c5` (#441)
+- Bump actions/create-github-app-token from 3.2.0 to 3.3.0 in the github-actions group (#442)
+- `formal/check_types.py --catalogue PATH` compares the verifiers with the named assertion-type catalogue and fails unless every property is established against it, including when the file is absent or predates a vocabulary. `mipiti-mcp` is no longer a development dependency. (#443)
+- Each release's notes are its CHANGELOG.md section, written when it is released; the changelog has no Unreleased section. (#443)
+- CHANGELOG.md's opening paragraph states how each version's section is written. (#444)
+
+## [0.56.0 and earlier]
 
 ### Security
 
@@ -19,6 +62,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `audit` lists how each mitigation group in a package was decided (a judge,
+  the behavioural analysis, a model check) and re-checks what an analysis
+  decision rests on: each certificate with Apalache 0.62.4 on Java 21 (its three checks,
+  from the module text and invariant the package carries) and each proof
+  with `tlapm` 3edc73c (every obligation must close), after checking that
+  each is bound to its own texts and that a proof is of its certificate's
+  invariant. A certificate or proof that does not hold up fails the audit;
+  one not re-checked here is a caveat, or a failure under
+  `--require-recheck`, as is one the package names and does not carry.
+  `--no-recheck` keeps the binding checks without running the tools;
+  `--recheck-timeout` bounds each run. Objectives satisfied by design are
+  checked the same way.
+- `audit` recomputes each clause's evidence strength (`clause_strength`) from
+  the evidence the package carries for it, and each control's from its
+  clauses, with the platform's rules, and fails a package whose stated
+  strength its own record does not give.
+- `audit` re-checks what each declared control was checked against
+  (`declared_commitments`): each clause's and cross-check finding's id from
+  its words, that a control served a verdict was declared over its text as the
+  package states it, and that a control served sufficient has a completed
+  cross-check with every finding dismissed by a person. A record that
+  disagrees with itself or its served status fails the audit. The summary
+  output states both sections.
 - Two assertion types whose pass is a statement about EVERY site in a declared
   scope rather than about one place. `sink_default_deny`: over every source
   file in `scope`, every site of a declared sink receives, at each guarded

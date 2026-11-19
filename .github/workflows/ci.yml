@@ -110,6 +110,9 @@ jobs:
     # `oidc_token=None`, breaking ~15 assume-no-OIDC tests. The BFS
     # spec test that needs real Fulcio bundles runs in a separate
     # job (test-spec-invariants) below.
+    permissions:
+      contents: read
+      packages: read  # pull the pinned design check tools image
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -119,7 +122,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
@@ -204,6 +207,24 @@ jobs:
         env:
           MIPITI_TEST_REQUIRE_TOOLCHAINS: "iverilog vvp verilator ghdl go cc javac"
         run: python -m pytest -v --ignore=tests/test_spec_invariants.py
+
+      - name: Log in to GHCR
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.docs_only != 'true' }}
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Re-check a design proof bundle in the pinned tools image
+        # The platform's certificate and proof in tests/fixtures/design-bundle,
+        # re-checked by Apalache and tlapm in the image design_check_image.json
+        # pins, as a user runs it.
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.docs_only != 'true' }}
+        run: |
+          mipiti-verify design-bundle tests/fixtures/design-bundle/design-proof-bundle.tar.gz \
+            --platform-pubkey tests/fixtures/design-bundle/platform-key.pem \
+            --recheck --tools image
 
       - name: Formal verification (Python BFS + cross-check)
         # Fail-safe inert skip: RUN unless detect-changes succeeded AND
@@ -319,7 +340,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
@@ -430,7 +451,8 @@ jobs:
     #
     # Skipped on automated version-bump PRs (head branch
     # `release/v*`, title `chore: release v*`). Those PRs only edit
-    # pyproject.toml's version string — they don't touch the spec,
+    # pyproject.toml's version string and add the version's CHANGELOG.md
+    # section — they don't touch the spec,
     # the implementation, or any code path the BFS exercises. The
     # heavy Fulcio-OIDC-minting run adds no signal there. Required-
     # check satisfaction is preserved: a job skipped via job-level
@@ -453,7 +475,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
